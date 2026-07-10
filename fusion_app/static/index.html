@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Fusion App — Multi-LLM Panel</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- Header -->
+    <header class="top-bar">
+      <h1>Fusion App</h1>
+      <span class="subtitle">Multi-LLM Panel</span>
+      <div class="header-badges">
+        <span class="key-badge" id="openrouterBadge">🔑 OR: —</span>
+        <span class="key-badge" id="ollamaBadge">🖥 Ollama: —</span>
+        <span class="key-badge" id="synthModeBadge" style="display:none;">⚡ Synth: ON</span>
+        <span class="key-badge" id="apiKeyBadge">🔐 API: —</span>
+        <div class="status-badge" id="statusBadge">● Loading…</div>
+      </div>
+    </header>
+
+    <!-- API Key settings (collapsible) -->
+    <section class="settings-panel">
+      <button class="settings-toggle" id="settingsToggle">⚙ Settings</button>
+      <div class="settings-body" id="settingsBody">
+        <div class="settings-hint">Keys are stored locally in <code>~/.fusion_app/config.json</code> and never sent anywhere except to OpenRouter/Ollama.</div>
+        <div class="setting-row">
+          <label>OpenRouter API Key</label>
+          <div class="input-group">
+            <input type="password" id="openrouterKey" placeholder="sk-or-…" spellcheck="false" />
+            <button class="btn-sm" id="toggleKeyVis">👁</button>
+          </div>
+          <span class="key-hint" id="openrouterKeyHint"></span>
+        </div>
+        <div class="setting-row">
+          <label>Ollama Base URL</label>
+          <input type="text" id="ollamaUrl" value="http://localhost:11434" spellcheck="false" />
+        </div>
+        <div class="setting-row">
+          <label>Synth Model Slot</label>
+          <select id="synthSlot" class="synth-slot-select">
+            <option value="-1">No synth</option>
+            <option value="0">Slot 0</option>
+            <option value="1">Slot 1</option>
+            <option value="2">Slot 2</option>
+            <option value="3">Slot 3</option>
+            <option value="4">Slot 4</option>
+          </select>
+          <span class="key-hint" id="synthSlotHint">Synth merges other model responses into one answer</span>
+        </div>
+        <div class="setting-row">
+          <label>Synth Mode (auto)</label>
+          <label class="toggle-switch">
+            <input type="checkbox" id="synthModeToggle" />
+            <span class="toggle-slider"></span>
+          </label>
+          <span class="key-hint">When ON, every chat auto-runs the synthesizer</span>
+        </div>
+        <div class="setting-row">
+          <label>Synth System Prompt</label>
+          <textarea id="synthSystemPrompt" rows="5" placeholder="Custom instructions for the synthesizer model…" spellcheck="false"></textarea>
+          <span class="key-hint">Customize how the synth model merges responses</span>
+        </div>
+        <div class="setting-row">
+          <label>Private API Key</label>
+          <div class="input-group">
+            <input type="password" id="privateApiKey" placeholder="For OpenCode / agent auth" spellcheck="false" />
+            <button class="btn-sm" id="toggleApiKeyVis">👁</button>
+          </div>
+          <span class="key-hint" id="privateApiKeyHint"></span>
+        </div>
+        <div class="setting-row">
+          <button class="btn btn-primary" id="saveSettings">Save Settings</button>
+          <span class="save-msg" id="saveMsg"></span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Slot configuration grid -->
+    <section class="slots-grid" id="slotsGrid">
+      <!-- 5 slot cards injected by JS -->
+    </section>
+
+    <!-- Prompt input -->
+    <section class="prompt-area">
+      <textarea id="promptInput" rows="3" placeholder="Send a prompt to all enabled models…"></textarea>
+      <div class="prompt-controls">
+        <input type="text" id="systemPrompt" placeholder="Optional system prompt…" spellcheck="false" />
+        <button class="btn btn-accent" id="sendBtn">► Send to All</button>
+        <button class="btn btn-stream" id="streamBtn">◉ Stream</button>
+        <button class="btn btn-synth" id="synthBtn">⚡ Synthesize</button>
+      </div>
+    </section>
+
+    <!-- Response grid -->
+    <section class="responses-grid" id="responsesGrid">
+      <!-- 5 response panels injected by JS -->
+    </section>
+
+    <!-- Synth panel (hidden by default) -->
+    <section class="synth-panel" id="synthPanel" style="display:none;">
+      <div class="synth-header">
+        <span>⚡ Synthesized Output</span>
+        <span class="synth-model-name" id="synthModelName">—</span>
+        <span class="latency" id="synthLatency"></span>
+      </div>
+      <div class="synth-content" id="synthContent">
+        <span class="placeholder">Run a synthesis to see the merged response here.</span>
+      </div>
+    </section>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

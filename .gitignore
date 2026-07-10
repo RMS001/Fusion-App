@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Testing
+.pytest_cache/
+htmlcov/
+.coverage
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Tools
+.opencode/
+.serena/
+graphify-out/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Personal notes / local eval harness (not part of the release)
+HANDOFF.md
+TEST_SETUP.md
+FUSION_EVAL_PLAN.md
+run_eval.py
