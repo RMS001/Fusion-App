@@ -389,6 +389,11 @@ All endpoints except `/health` and the UI require `Authorization: Bearer <privat
 - `~/.fusion_app/config.json` stores keys in plaintext and is written with `0600` permissions. A corrupt config file is backed up to `config.json.bak` instead of being silently replaced.
 - On `/v1/chat/completions`, upstream provider failures return an OpenAI-style error object with HTTP 502 (not a 200 with error text).
 
+## Limitations & Notes
+
+- **Single process.** The server runs as a single process (there is no `--workers` option). Slot configuration lives in process memory, so multiple workers would serve stale config after a settings change. This is not a practical limit — requests are async and the bottleneck is model inference, not the web server.
+- **Prompt-compression middleware.** If you route this app through prompt-compression or context-reduction middleware, exempt the Synthesizer stage: synthesis quality depends on the synth model seeing the other slots' full drafts, and lossy compression of those drafts degrades the merged answer silently. Compressing multi-turn *history* upstream is fine (and saves tokens × number of slots).
+
 ## Running Tests
 
 ```bash
