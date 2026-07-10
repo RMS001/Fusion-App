@@ -16,7 +16,7 @@ Use it two ways:
 ![Two local models drafting side by side while a third synthesizes their answers](docs/panel-filled.png)
 *Two Ollama models on different machines answer in parallel; the slot-2 synthesizer merges their drafts into the output below.*
 
-> **Project status:** stable and feature-complete. Not actively maintained — issues and PRs may not receive timely responses.
+> **Project status:** stable and feature-complete — issues and PRs may not receive timely responses.
 
 ## Quick Start
 
