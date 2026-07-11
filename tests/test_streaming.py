@@ -3,6 +3,7 @@ End-to-end tests for the /api/chat/stream SSE contract with mocked upstreams:
 token events carry plain text, partial failures surface as error events, and
 the synthesizer receives clean collected text (not raw provider JSON).
 """
+import asyncio
 import json
 
 import httpx
@@ -195,3 +196,79 @@ async def test_v1_stream_yields_openai_chunks(client: AsyncClient):
     ]
     assert deltas[:-1] == ["Hi", " there"]
     assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+@pytest.mark.anyio
+async def test_stream_deltas_emits_heartbeats_during_silence(monkeypatch):
+    """A silent upstream produces SSE comment heartbeats, and the stream still
+    finishes with the normal content/finish/[DONE] frames once deltas arrive."""
+    from fusion_app import api
+
+    monkeypatch.setattr(api, "HEARTBEAT_INTERVAL", 0.05)
+
+    async def slow_gen():
+        await asyncio.sleep(0.18)
+        yield "late"
+
+    frames = [f async for f in api._stream_deltas(slow_gen(), "cid", 0, "m")]
+
+    heartbeat_idxs = [i for i, f in enumerate(frames) if f == ": heartbeat\n\n"]
+    assert len(heartbeat_idxs) >= 2
+
+    content_idx = next(
+        i for i, f in enumerate(frames)
+        if f.startswith("data: ") and '"late"' in f
+    )
+    # Heartbeats fill the silence BEFORE the first delta, never after [DONE]
+    assert all(i < content_idx for i in heartbeat_idxs)
+    assert frames[-1] == "data: [DONE]\n\n"
+    assert json.loads(frames[-2][6:])["choices"][0]["finish_reason"] == "stop"
+
+
+@pytest.mark.anyio
+async def test_v1_synth_stream_heartbeats_while_drafts_gather(
+    client: AsyncClient, monkeypatch
+):
+    """In synth mode, /v1 streaming emits heartbeats during the draft-gathering
+    silent window without corrupting the OpenAI chunk stream."""
+    from fusion_app import api
+
+    monkeypatch.setattr(api, "HEARTBEAT_INTERVAL", 0.05)
+
+    slots = five_slots(
+        s0=SlotConfig(provider="ollama", model="llama3.2", enabled=True),
+        s2=SlotConfig(provider="openrouter", model="synth/model", enabled=True),
+    )
+    await configure(
+        client, slots, openrouter_key="sk-test", synth_mode=True, synth_slot=2
+    )
+
+    async def slow_draft(request):
+        await asyncio.sleep(0.2)
+        return httpx.Response(200, text=ollama_ndjson("draft"))
+
+    with respx.mock:
+        respx.post(OLLAMA_CHAT_URL).mock(side_effect=slow_draft)
+        respx.post(OPENROUTER_CHAT_URL).mock(
+            return_value=httpx.Response(200, text=openrouter_sse("synth!"))
+        )
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "hi"}], "stream": True},
+        )
+
+    assert resp.status_code == 200
+    assert ": heartbeat" in resp.text
+
+    # Comment lines must not break OpenAI-format parsing of data: lines
+    payloads = [
+        line[6:] for line in resp.text.split("\n") if line.startswith("data: ")
+    ]
+    assert payloads[-1] == "[DONE]"
+    chunks = [json.loads(p) for p in payloads[:-1]]
+    deltas = [
+        c["choices"][0]["delta"].get("content")
+        for c in chunks
+        if c.get("object") == "chat.completion.chunk"
+    ]
+    assert "synth!" in "".join(d for d in deltas if d)

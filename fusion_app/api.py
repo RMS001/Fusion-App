@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import secrets
@@ -114,15 +115,43 @@ def _v1_chunk(
     return f"data: {json.dumps(frame)}\n\n"
 
 
+HEARTBEAT_INTERVAL = 10.0
+
+
 async def _stream_deltas(agen, completion_id: str, created: int, model: str):
-    """Wrap a plain-text delta generator into OpenAI-style SSE chunks."""
+    """Wrap a plain-text delta generator into OpenAI-style SSE chunks.
+
+    Whenever HEARTBEAT_INTERVAL passes with no delta (drafts being gathered,
+    synth model loading or thinking), emit an SSE comment line to keep bytes
+    flowing so idle timeouts in clients and proxies don't kill the stream.
+    Comment lines are ignored by SSE parsers, so the OpenAI chunk format is
+    unaffected. The pending __anext__ is shielded — a heartbeat timeout must
+    not cancel the underlying generator.
+    """
+    ait = agen.__aiter__()
+    next_delta: Optional[asyncio.Task] = None
     try:
-        async for delta in agen:
+        while True:
+            if next_delta is None:
+                next_delta = asyncio.ensure_future(ait.__anext__())
+            try:
+                delta = await asyncio.wait_for(
+                    asyncio.shield(next_delta), timeout=HEARTBEAT_INTERVAL
+                )
+            except asyncio.TimeoutError:
+                yield ": heartbeat\n\n"
+                continue
+            except StopAsyncIteration:
+                break
+            next_delta = None
             if delta:
                 yield _v1_chunk(completion_id, created, model, delta=delta)
     except Exception as e:
         err = {"error": {"message": str(e), "type": "upstream_error"}}
         yield f"data: {json.dumps(err)}\n\n"
+    finally:
+        if next_delta is not None:
+            next_delta.cancel()
     yield _v1_chunk(completion_id, created, model, finish="stop")
     yield "data: [DONE]\n\n"
 

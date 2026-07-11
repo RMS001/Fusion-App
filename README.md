@@ -16,7 +16,7 @@ Use it two ways:
 ![Two local models drafting side by side while a third synthesizes their answers](docs/panel-filled.png)
 *Two Ollama models on different machines answer in parallel; the slot-2 synthesizer merges their drafts into the output below.*
 
-> **Project status:** stable and feature-complete — issues and PRs may not receive timely responses.
+> **Project status:** stable and feature-complete. Not actively maintained — issues and PRs may not receive timely responses.
 
 ## Quick Start
 
@@ -314,6 +314,17 @@ curl http://localhost:8000/v1/chat/completions \
 - When **Synth Mode** is ON in settings, every `/v1/chat/completions` call auto-runs the synth flow
 - **Streaming**: The synth model's response streams token-by-token (drafts are gathered internally first)
 - **Non-streaming**: Response includes `"fusion_synth"` metadata with individual draft responses
+
+#### Timeouts & long silent windows
+
+In synth mode there is no synth output to stream until **every draft has finished** — with large local models that window can run to minutes (a cold model load alone can add 30–60+ seconds). Fusion keeps the connection alive through it: streaming responses emit an SSE comment heartbeat (`: heartbeat`) every 10 seconds of silence, which SSE parsers ignore, so idle timeouts in clients and reverse proxies don't drop the stream.
+
+Recommended client/config settings for long panel runs:
+
+- **OpenCode (and similar agent tools)** — raise the per-provider timeout in its JSON config generously (e.g. `600000` ms) for the Fusion provider. Heartbeats reset *idle* timers, but a total-request timeout still needs headroom for the full draft + synthesis run.
+- **Ollama** — set `keep_alive` (e.g. `OLLAMA_KEEP_ALIVE=1h`, or per-model) so panel models stay resident between requests. Without it, a panel can pay a cold-load penalty on several slots at once.
+- **Fusion `slot_timeout`** (default `300` s) — caps each draft. A draft that hits the cap doesn't fail the request; its timeout message is passed to the synthesizer in place of a draft. If your slowest slot legitimately needs longer (big model + long thinking), raise `slot_timeout` in Settings or via `PUT /api/config`.
+- **Reverse proxies** — the heartbeat keeps idle-read timeouts happy, but check any hard total-response limits (e.g. Cloudflare's 100 s default applies to the *first byte*, which heartbeats satisfy).
 
 **Response (synth mode off):**
 ```json
