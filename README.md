@@ -355,7 +355,7 @@ In synth mode there is no synth output to stream until **every draft has finishe
 
 Recommended client/config settings for long panel runs:
 
-- **OpenCode (and similar agent tools)** — raise the per-provider timeout in its JSON config generously (e.g. `600000` ms) for the Fusion provider. Heartbeats reset *idle* timers, but a total-request timeout still needs headroom for the full draft + synthesis run.
+- **OpenCode (and similar agent tools)** — raise the per-provider timeout in its JSON config generously (e.g. `600000` ms) for the Fusion provider. Heartbeats reset *idle* timers, but a total-request timeout still needs headroom for the full draft + synthesis run. Note these clients work for plain chat only — tool/function calling is not supported (see [Limitations & Notes](#limitations--notes)).
 - **Ollama** — set `keep_alive` (e.g. `OLLAMA_KEEP_ALIVE=1h`, or per-model) so panel models stay resident between requests. Without it, a panel can pay a cold-load penalty on several slots at once.
 - **Fusion `slot_timeout`** (default `300` s) — caps each draft. A draft that hits the cap doesn't fail the request; its timeout message is passed to the synthesizer in place of a draft. If your slowest slot legitimately needs longer (big model + long thinking), raise `slot_timeout` in Settings or via `PUT /api/config`.
 - **Reverse proxies** — the heartbeat keeps idle-read timeouts happy, but check any hard total-response limits (e.g. Cloudflare's 100 s default applies to the *first byte*, which heartbeats satisfy).
@@ -436,6 +436,8 @@ All endpoints except `/health` and the UI require `Authorization: Bearer <privat
 
 ## Limitations & Notes
 
+- **No tool / function calling on `/v1`.** The OpenAI-compatible endpoint (`/v1/chat/completions`, model id `fusion-panel`) does not support OpenAI tool calling: a `tools`/`tool_choice` array in the request is silently dropped before it reaches the slot models, and responses always close with `finish_reason: "stop"` and plain text content — never a `tool_calls` array. Agentic coding clients (OpenCode, Cline, etc.) will *appear* to work but no file or tool action ever executes; models may even narrate tool use as prose. This is partly by design: synth mode merges multiple models' prose, and structured tool calls from different models can't be meaningfully merged. Use the Fusion App's own web UI or a plain chat client (Open WebUI, or any OpenAI-compatible client that doesn't rely on tool calling); agentic clients are fine for plain Q&A chat only.
+- **Reasoning models with small `max_tokens`.** A synth model that spends heavily on reasoning tokens can exhaust a small `max_tokens` budget before emitting any answer text, returning empty content. Give reasoning-heavy synth models generous token budgets.
 - **Single process.** The server runs as a single process (there is no `--workers` option). Slot configuration lives in process memory, so multiple workers would serve stale config after a settings change. This is not a practical limit — requests are async and the bottleneck is model inference, not the web server.
 - **Prompt-compression middleware.** If you route this app through prompt-compression or context-reduction middleware, exempt the Synthesizer stage: synthesis quality depends on the synth model seeing the other slots' full drafts, and lossy compression of those drafts degrades the merged answer silently. Compressing multi-turn *history* upstream is fine (and saves tokens × number of slots).
 
