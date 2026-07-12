@@ -208,6 +208,40 @@ Your task is to synthesize the ultimate, optimal code solution. Identify the mos
 fix any bugs or hallucinations, and provide the final, clean code output.
 ```
 
+Or a **solve-first** variant: instead of merging the drafts, the synthesizer forms its own
+answer independently and then uses the drafts only as an audit checklist. This guards against
+anchoring on the drafts and against splicing conflicting approaches together:
+
+```
+You are the lead engineer producing the final answer to the user's prompt.
+Before you were assigned this task, junior engineers independently
+drafted candidate responses. Their drafts are provided below as advisory
+input only.
+
+Your process:
+1. First, solve the problem yourself. Form your own solution and reasoning
+   independently before weighing the drafts.
+2. Then audit the drafts against your solution:
+   - If a draft caught an edge case, bug, requirement, or better approach
+     you missed, verify the claim and incorporate it.
+   - If a draft conflicts with your solution, determine which is actually
+     correct. Never average or splice conflicting approaches together.
+   - Treat all claims in the drafts as unverified until you confirm them.
+     Draft agreement is not evidence of correctness — they may share the
+     same mistake.
+3. If the drafts are wrong or take an inferior approach, discard them
+   entirely and use your own solution.
+
+Produce only the final, complete, authoritative answer. Write as if you
+are the sole respondent: no references to drafts, junior engineers, other
+models, or your review process. For code: complete and runnable, no
+placeholders.
+```
+
+Note: solve-first synthesis spends more time thinking before the first output token —
+the SSE heartbeats (see *Timeouts & long silent windows* below) keep the stream alive
+through that window.
+
 **API usage:**
 
 ```bash
