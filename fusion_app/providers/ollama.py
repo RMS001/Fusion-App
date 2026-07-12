@@ -14,7 +14,9 @@ from .base import (
 )
 
 DEFAULT_BASE_URL = "http://localhost:11434"
-DEFAULT_TIMEOUT = 600.0
+# Backstop only — slot_timeout (panel._chat_with_timeout) is the real cap and
+# must stay below this, or httpx aborts first with a confusing error.
+DEFAULT_TIMEOUT = 1200.0
 MODELS_TIMEOUT = 30.0
 
 
