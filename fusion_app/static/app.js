@@ -369,7 +369,7 @@ function buildSlotCards() {
         <div class="slot-advanced-body" style="display:none;">
           <input class="slot-url-override" type="text" placeholder="e.g. http://192.168.1.10:11434" spellcheck="false" />
           <span class="slot-url-hint">Only needed for Ollama on a different machine. Leave blank to use the global URL from Settings.</span>
-          <input class="slot-timeout" type="number" min="1" step="1" placeholder="Timeout override (seconds)" />
+          <input class="slot-timeout" type="number" min="1" step="1" placeholder="Timeout (seconds)" />
           <span class="slot-url-hint">Blank = global Slot Timeout from Settings. Ollama requests are hard-capped at 1200s by the HTTP client.</span>
         </div>
       </div>

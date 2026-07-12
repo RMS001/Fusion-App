@@ -534,8 +534,9 @@ body {
   box-shadow: 0 0 0 2px var(--accent-glow);
 }
 
-/* ── Slot URL override input ─────────────────────────────── */
-.slot-url-override {
+/* ── Slot URL override + timeout inputs ──────────────────── */
+.slot-url-override,
+.slot-timeout {
   width: 100%;
   padding: 5px 8px;
   margin-top: 4px;
@@ -546,12 +547,14 @@ body {
   font-size: 11px;
   font-family: var(--font);
 }
-.slot-url-override:focus {
+.slot-url-override:focus,
+.slot-timeout:focus {
   outline: none;
   border-color: var(--accent);
   color: var(--text);
 }
-.slot-url-override::placeholder {
+.slot-url-override::placeholder,
+.slot-timeout::placeholder {
   color: var(--text-dim);
   opacity: 0.5;
 }
