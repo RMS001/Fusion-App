@@ -321,11 +321,10 @@ class PanelManager:
             msg = resp.error if resp.error else resp.content
             parts.append(f"## {label}\n{msg}\n")
 
-        parts.append(
-            "\nSynthesize the best elements from the drafts above into a single, "
-            "definitive response. Write it as your own answer — do not reference "
-            "the individual drafts."
-        )
+        # Strategy-neutral: how to weigh the drafts is entirely the
+        # synth_system_prompt's job — a merge/solve-first directive here would
+        # override it from last position.
+        parts.append("\nProduce your final response to the original prompt now.")
 
         return [
             {"role": "system", "content": self.config.synth_system_prompt},
