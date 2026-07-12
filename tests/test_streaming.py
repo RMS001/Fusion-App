@@ -137,10 +137,9 @@ async def test_stream_synth_mode_feeds_clean_text_to_synth(client: AsyncClient):
         respx.post(OLLAMA_CHAT_URL).mock(
             return_value=httpx.Response(200, text=ollama_ndjson("Hello", " world"))
         )
+        # Synth is streamed now, so the mock must answer in SSE format
         synth_route = respx.post(OPENROUTER_CHAT_URL).mock(
-            return_value=httpx.Response(
-                200, json={"choices": [{"message": {"content": "synthesized!"}}]}
-            )
+            return_value=httpx.Response(200, text=openrouter_sse("synthesized!"))
         )
         resp = await client.post("/api/chat/stream", json={"prompt": "hi"})
 
@@ -272,3 +271,131 @@ async def test_v1_synth_stream_heartbeats_while_drafts_gather(
         if c.get("object") == "chat.completion.chunk"
     ]
     assert "synth!" in "".join(d for d in deltas if d)
+
+
+# ── Per-slot timeouts ────────────────────────────────────────────────────────
+
+
+@pytest.mark.anyio
+async def test_per_slot_timeout_round_trip(client: AsyncClient):
+    slots = five_slots(
+        s0=SlotConfig(provider="ollama", model="llama3.2", enabled=True, timeout=120.5)
+    )
+    await configure(client, slots)
+
+    resp = await client.get("/api/config")
+    data = resp.json()
+    assert data["slots"][0]["timeout"] == 120.5
+    assert data["slots"][1]["timeout"] is None
+
+
+@pytest.mark.anyio
+async def test_per_slot_timeout_rejects_nonpositive(client: AsyncClient):
+    slots = [s.model_dump() for s in five_slots()]
+    slots[0]["timeout"] = -5
+    resp = await client.put("/api/config", json={"slots": slots})
+    assert resp.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_per_slot_timeout_overrides_global(client: AsyncClient):
+    """A slot with its own timeout uses it instead of the (longer) global."""
+    slots = five_slots(
+        s0=SlotConfig(provider="ollama", model="llama3.2", enabled=True, timeout=0.2)
+    )
+    await configure(client, slots, slot_timeout=30.0)
+
+    async def slow(request):
+        await asyncio.sleep(1.0)
+        return httpx.Response(200, text=ollama_ndjson("late"))
+
+    with respx.mock:
+        respx.post(OLLAMA_CHAT_URL).mock(side_effect=slow)
+        resp = await client.post("/api/chat", json={"prompt": "hi", "slot": 0})
+
+    data = resp.json()
+    assert data["response"]["error"] == "Timed out after 0.2s"
+
+
+@pytest.mark.anyio
+async def test_slot_timeout_falls_back_to_global(client: AsyncClient):
+    """A slot without its own timeout uses the global slot_timeout."""
+    slots = five_slots(
+        s0=SlotConfig(provider="ollama", model="llama3.2", enabled=True)
+    )
+    await configure(client, slots, slot_timeout=0.2)
+
+    async def slow(request):
+        await asyncio.sleep(1.0)
+        return httpx.Response(200, text=ollama_ndjson("late"))
+
+    with respx.mock:
+        respx.post(OLLAMA_CHAT_URL).mock(side_effect=slow)
+        resp = await client.post("/api/chat", json={"prompt": "hi", "slot": 0})
+
+    data = resp.json()
+    assert data["response"]["error"] == "Timed out after 0.2s"
+
+
+# ── Streaming synthesis ──────────────────────────────────────────────────────
+
+
+@pytest.mark.anyio
+async def test_stream_synth_param_streams_synth_tokens(client: AsyncClient):
+    """With synth=true in the body (synth_mode OFF), drafts stream first,
+    then synthesis arrives as synth_start + synth_token events and a final
+    synth event carrying the full content."""
+    slots = five_slots(
+        s0=SlotConfig(provider="ollama", model="llama3.2", enabled=True),
+        s2=SlotConfig(provider="openrouter", model="synth/model", enabled=True),
+    )
+    await configure(
+        client, slots, openrouter_key="sk-test", synth_mode=False, synth_slot=2
+    )
+
+    with respx.mock:
+        respx.post(OLLAMA_CHAT_URL).mock(
+            return_value=httpx.Response(200, text=ollama_ndjson("draft"))
+        )
+        respx.post(OPENROUTER_CHAT_URL).mock(
+            return_value=httpx.Response(200, text=openrouter_sse("syn", "th!"))
+        )
+        resp = await client.post(
+            "/api/chat/stream", json={"prompt": "hi", "synth": True}
+        )
+
+    assert resp.status_code == 200
+    events = parse_sse(resp.text)
+    etypes = [e for e, _ in events]
+
+    assert "synth_start" in etypes
+    assert "synth_token" in etypes
+    # synthesis only starts after the draft finished
+    assert etypes.index("synth_start") > etypes.index("done")
+
+    tokens = "".join(d["content"] for e, d in events if e == "synth_token")
+    assert tokens == "synth!"
+
+    final = next(d for e, d in events if e == "synth")
+    assert final["content"] == "synth!"
+    assert final["error"] is None
+    assert final["synth_model"] == "synth/model"
+
+
+@pytest.mark.anyio
+async def test_stream_without_synth_param_has_no_synth_events(client: AsyncClient):
+    """synth_mode OFF and no synth flag → plain draft streaming only."""
+    slots = five_slots(
+        s0=SlotConfig(provider="ollama", model="llama3.2", enabled=True),
+    )
+    await configure(client, slots, synth_mode=False)
+
+    with respx.mock:
+        respx.post(OLLAMA_CHAT_URL).mock(
+            return_value=httpx.Response(200, text=ollama_ndjson("draft"))
+        )
+        resp = await client.post("/api/chat/stream", json={"prompt": "hi"})
+
+    etypes = [e for e, _ in parse_sse(resp.text)]
+    assert "synth_start" not in etypes
+    assert "synth" not in etypes

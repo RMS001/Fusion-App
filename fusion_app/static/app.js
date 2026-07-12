@@ -15,6 +15,7 @@ const settingsBody = $("#settingsBody");
 const openrouterKey = $("#openrouterKey");
 const openrouterKeyHint = $("#openrouterKeyHint");
 const ollamaUrl = $("#ollamaUrl");
+const slotTimeoutInput = $("#slotTimeout");
 const saveSettingsBtn = $("#saveSettings");
 const saveMsg = $("#saveMsg");
 const toggleKeyVis = $("#toggleKeyVis");
@@ -186,6 +187,9 @@ async function loadConfig() {
     ollamaBadge.textContent = `🖥 Ollama: ${configData.ollama_base_url}`;
     ollamaBadge.className = "key-badge set";
 
+    // Global slot timeout
+    slotTimeoutInput.value = configData.slot_timeout ?? "";
+
     configData.slots.forEach((slot, i) => {
       const card = document.querySelector(`.slot-card[data-slot="${i}"]`);
       if (!card) return;
@@ -200,13 +204,17 @@ async function loadConfig() {
       modelInput.value = slot.model;
       if (urlOverride) {
         urlOverride.value = slot.base_url_override || "";
-        // Auto-expand Advanced section if a URL override is set
-        if (slot.base_url_override) {
-          const advBody = card.querySelector(".slot-advanced-body");
-          const advToggle = card.querySelector(".slot-advanced-toggle");
-          if (advBody) advBody.style.display = "block";
-          if (advToggle) advToggle.textContent = "▾ Advanced";
-        }
+      }
+      const slotTimeout = card.querySelector(".slot-timeout");
+      if (slotTimeout) {
+        slotTimeout.value = slot.timeout ?? "";
+      }
+      // Auto-expand Advanced section if any override is set
+      if (slot.base_url_override || slot.timeout) {
+        const advBody = card.querySelector(".slot-advanced-body");
+        const advToggle = card.querySelector(".slot-advanced-toggle");
+        if (advBody) advBody.style.display = "block";
+        if (advToggle) advToggle.textContent = "▾ Advanced";
       }
 
       // Update response panel header
@@ -234,6 +242,8 @@ const CONFIG_FIELD_LABELS = {
   private_api_key: "Private API key",
   synth_slot: "Synth slot",
   synth_system_prompt: "Synth system prompt",
+  slot_timeout: "Slot timeout",
+  timeout: "timeout",
 };
 
 // Turn a 422 response into a short human-readable message,
@@ -279,6 +289,9 @@ async function saveConfig() {
     } else {
       slotData.base_url_override = null;
     }
+    const timeoutEl = card.querySelector(".slot-timeout");
+    const timeoutVal = timeoutEl ? timeoutEl.value.trim() : "";
+    slotData.timeout = timeoutVal ? parseFloat(timeoutVal) : null;
     slots.push(slotData);
   }
 
@@ -289,6 +302,11 @@ async function saveConfig() {
     synth_mode: synthModeToggle.checked,
     slots,
   };
+
+  const globalTimeout = slotTimeoutInput.value.trim();
+  if (globalTimeout) {
+    body.slot_timeout = parseFloat(globalTimeout);
+  }
 
   // Include synth system prompt if user modified it
   const promptVal = synthSystemPrompt.value.trim();
@@ -351,6 +369,8 @@ function buildSlotCards() {
         <div class="slot-advanced-body" style="display:none;">
           <input class="slot-url-override" type="text" placeholder="e.g. http://192.168.1.10:11434" spellcheck="false" />
           <span class="slot-url-hint">Only needed for Ollama on a different machine. Leave blank to use the global URL from Settings.</span>
+          <input class="slot-timeout" type="number" min="1" step="1" placeholder="Timeout override (seconds)" />
+          <span class="slot-url-hint">Blank = global Slot Timeout from Settings. Ollama requests are hard-capped at 1200s by the HTTP client.</span>
         </div>
       </div>
       <button class="model-refresh-btn" data-slot="${i}">↻ Fetch models</button>
@@ -623,7 +643,7 @@ async function sendSingleShot(prompt) {
 }
 
 // ── Streaming ──────────────────────────────────────────────────────────────
-async function sendStreaming(prompt) {
+async function sendStreaming(prompt, forceSynth = false) {
   sendBtn.disabled = true;
   streamBtn.disabled = true;
   streamBtn.textContent = "◉ Streaming…";
@@ -636,9 +656,21 @@ async function sendStreaming(prompt) {
     }
   }
 
+  // The synth slot doesn't stream drafts — label it so it doesn't sit on "Waiting…"
+  const synthIdx = parseInt(synthSlot.value, 10);
+  const expectSynth = (forceSynth || synthModeToggle.checked) && synthIdx >= 0;
+  if (expectSynth) {
+    const synthSlotPanel = document.querySelector(`.response-panel[data-slot="${synthIdx}"]`);
+    if (synthSlotPanel) {
+      synthSlotPanel.querySelector(".response-content").innerHTML =
+        '<span class="placeholder">Synthesizer — runs after drafts finish</span>';
+    }
+  }
+
   const body = {
     prompt,
     system_prompt: systemPromptInput.value || null,
+    synth: forceSynth,
   };
 
   try {
@@ -655,6 +687,7 @@ async function sendStreaming(prompt) {
     const decoder = new TextDecoder();
     let buffer = "";
     const fullTexts = {};
+    let synthText = "";
 
     while (true) {
       const { done, value } = await reader.read();
@@ -678,8 +711,27 @@ async function sendStreaming(prompt) {
             const event = JSON.parse(payload);
             const slotIdx = event.slot;
 
+            if (event.type === "synth_start") {
+              // Drafts done — synthesis starting. A thinking model may be
+              // silent for a while before its first visible token.
+              synthModelName.textContent = event.synth_model || "synth";
+              synthLatency.textContent = "";
+              synthContent.innerHTML =
+                '<span class="placeholder">🧠 Synthesizing… (thinking models may be silent before the first token)</span>';
+              synthPanel.style.display = "block";
+              synthPanel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+              continue;
+            }
+
+            if (event.type === "synth_token") {
+              synthText += event.content;
+              synthContent.innerHTML = escapeHtml(synthText) + '<span class="cursor"></span>';
+              synthContent.scrollTop = synthContent.scrollHeight;
+              continue;
+            }
+
             if (event.type === "synth") {
-              // Synth result after streaming in synth mode
+              // Final synth result (also arrives after synth_token streaming)
               synthModelName.textContent = event.synth_model || "synth";
               synthLatency.textContent = event.latency_ms ? `⏱ ${event.latency_ms.toFixed(0)}ms` : "";
               if (event.error) {
@@ -750,79 +802,14 @@ async function sendSynth() {
 
   synthBtn.disabled = true;
   synthBtn.textContent = "⚡ Synthesizing…";
-  sendBtn.disabled = true;
-  streamBtn.disabled = true;
-  markPanelsWaiting();
-
-  const body = {
-    prompt,
-    system_prompt: systemPromptInput.value || null,
-  };
 
   try {
-    const resp = await apiFetch("/api/synth", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal: abortController.signal,
-    });
-
-    if (!resp.ok) throw new Error(await resp.text());
-    const data = await resp.json();
-
-    // Show individual responses
-    for (const [label, item] of Object.entries(data.responses)) {
-      // Find the slot index from the label "Slot N (model)"
-      const match = label.match(/Slot (\d)/);
-      if (!match) continue;
-      const i = parseInt(match[1], 10);
-      const panel = document.querySelector(`.response-panel[data-slot="${i}"]`);
-      if (!panel) continue;
-      const content = panel.querySelector(".response-content");
-      const latency = panel.querySelector(".latency");
-
-      if (item.model) {
-        panel.querySelector(".model-name").textContent = item.model;
-      }
-      if (item.error) {
-        content.innerHTML = `<span class="error">Error: ${escapeHtml(item.error)}</span>`;
-        latency.textContent = `⏱ ${item.latency_ms.toFixed(0)}ms`;
-      } else {
-        content.textContent = item.content;
-        latency.textContent = `⏱ ${item.latency_ms.toFixed(0)}ms`;
-      }
-    }
-
-    // The synth slot answers below, not as a panelist — clear its waiting state
-    const synthSlotIdx = parseInt(synthSlot.value, 10);
-    const synthSlotPanel = document.querySelector(`.response-panel[data-slot="${synthSlotIdx}"]`);
-    if (synthSlotPanel) {
-      synthSlotPanel.querySelector(".response-content").innerHTML =
-        '<span class="placeholder">Synthesizer — see output below</span>';
-    }
-
-    // Show synth output
-    const synthesis = data.synthesis;
-    if (synthesis.error) {
-      synthContent.innerHTML = `<span class="error">Error: ${escapeHtml(synthesis.error)}</span>`;
-    } else {
-      synthContent.textContent = synthesis.content;
-    }
-    synthModelName.textContent = `${synthesis.model}`;
-    synthLatency.textContent = synthesis.error ? "" : `⏱ ${synthesis.latency_ms.toFixed(0)}ms`;
-    synthPanel.style.display = "block";
-    synthPanel.scrollIntoView({ behavior: "smooth", block: "nearest" });
-
-  } catch (e) {
-    if (e.name !== "AbortError") {
-      synthContent.innerHTML = `<span class="error">Synth failed: ${escapeHtml(e.message)}</span>`;
-      synthPanel.style.display = "block";
-    }
+    // Stream drafts and synthesis so long runs always show progress
+    // instead of a silent multi-minute wait.
+    await sendStreaming(prompt, true);
   } finally {
     synthBtn.disabled = false;
     synthBtn.textContent = "⚡ Synthesize";
-    sendBtn.disabled = false;
-    streamBtn.disabled = false;
   }
 }
 

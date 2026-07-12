@@ -270,6 +270,11 @@ def create_app() -> FastAPI:
             le=4,
             description="If set, only send to this slot (0-4). If omitted, send to all enabled.",
         )
+        synth: bool = Field(
+            default=False,
+            description="Streaming only: run synthesis after the drafts even if "
+            "synth_mode is off (used by the UI's Synthesize button).",
+        )
 
     class ChatResponseItem(BaseModel):
         content: str
@@ -360,7 +365,11 @@ def create_app() -> FastAPI:
         only_slot = body.slot
         exclude_synth = (
             cfg.synth_slot
-            if (only_slot is None and cfg.synth_mode and cfg.synth_slot >= 0)
+            if (
+                only_slot is None
+                and (cfg.synth_mode or body.synth)
+                and cfg.synth_slot >= 0
+            )
             else None
         )
 
@@ -381,19 +390,36 @@ def create_app() -> FastAPI:
                     slot = cfg.slots[slot_idx]
                     collected_responses[f"Slot {slot_idx} ({slot.model})"] = event["full_content"]
 
-            # If synth mode is ON, run synth using already-collected responses
+            # If synth was requested, stream it using already-collected responses
             if exclude_synth is not None and collected_responses:
-                synth_result = await manager.synthesize_from_collected(
-                    messages, collected_responses, **kwargs
-                )
-                s = synth_result["synthesis"]
+                synth_model = cfg.slots[cfg.synth_slot].model or "synth"
+                start_event = {
+                    "type": "synth_start",
+                    "synth_slot": cfg.synth_slot,
+                    "synth_model": synth_model,
+                }
+                yield f"event: synth_start\ndata: {json.dumps(start_event)}\n\n"
+
+                synth_started = time.monotonic()
+                full_content = ""
+                synth_error = None
+                try:
+                    async for delta in manager.synthesize_stream_from_collected(
+                        messages, collected_responses, **kwargs
+                    ):
+                        full_content += delta
+                        token_event = {"type": "synth_token", "content": delta}
+                        yield f"event: synth_token\ndata: {json.dumps(token_event)}\n\n"
+                except Exception as e:
+                    synth_error = str(e)
+
                 synth_event = {
                     "type": "synth",
                     "synth_slot": cfg.synth_slot,
-                    "synth_model": s.model,
-                    "content": s.content if not s.error else f"[Synth error: {s.error}]",
-                    "error": s.error,
-                    "latency_ms": s.latency_ms,
+                    "synth_model": synth_model,
+                    "content": full_content if not synth_error else f"[Synth error: {synth_error}]",
+                    "error": synth_error,
+                    "latency_ms": (time.monotonic() - synth_started) * 1000,
                 }
                 yield f"event: synth\ndata: {json.dumps(synth_event)}\n\n"
 

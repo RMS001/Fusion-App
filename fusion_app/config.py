@@ -47,6 +47,12 @@ class SlotConfig(BaseModel):
         description="Override URL for this slot (e.g. a specific Ollama node IP). "
         "Falls back to global ollama_base_url if not set.",
     )
+    timeout: Optional[float] = Field(
+        default=None,
+        gt=0,
+        description="Per-slot timeout in seconds for non-streaming calls. "
+        "Falls back to global slot_timeout if not set.",
+    )
 
     @field_validator("base_url_override")
     @classmethod

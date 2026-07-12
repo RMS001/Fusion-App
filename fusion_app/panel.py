@@ -46,7 +46,7 @@ class PanelManager:
     ) -> ChatResponse:
         """Run a slot's chat with the configured per-slot deadline."""
         provider = self.get_provider(slot)
-        timeout = self.config.slot_timeout
+        timeout = slot.timeout or self.config.slot_timeout
         try:
             return await asyncio.wait_for(
                 provider.chat(messages, slot.model, **kwargs), timeout=timeout
@@ -56,7 +56,7 @@ class PanelManager:
                 content="",
                 model=slot.model,
                 latency_ms=timeout * 1000,
-                error=f"Timed out after {timeout:.0f}s",
+                error=f"Timed out after {timeout:g}s",
             )
 
     # ── Single-shot chat ───────────────────────────────────────────
@@ -356,3 +356,32 @@ class PanelManager:
         synthesis = await self._chat_with_timeout(synth_slot, synth_messages, **kwargs)
 
         return {"synthesis": synthesis}
+
+    async def synthesize_stream_from_collected(
+        self, messages: list[dict], collected_responses: dict[str, str], **kwargs
+    ) -> AsyncGenerator[str, None]:
+        """
+        Stream the synth model's response token-by-token using pre-collected
+        draft texts (the streaming twin of synthesize_from_collected).
+
+        Yields plain-text content deltas. No wall-clock timeout: the tokens
+        themselves are the liveness signal, matching the other streaming paths.
+        """
+        config_error = self._synth_config_error()
+        if config_error:
+            yield f"[Error: {config_error.error}]"
+            return
+
+        synth_slot = self.config.slots[self.config.synth_slot]
+
+        responses = {
+            label: ChatResponse(content=text, model=label)
+            for label, text in collected_responses.items()
+        }
+
+        synth_messages = self._build_synth_messages(messages, responses)
+        synth_provider = self.get_provider(synth_slot)
+        async for chunk in synth_provider.chat_stream(
+            synth_messages, synth_slot.model, **kwargs
+        ):
+            yield chunk

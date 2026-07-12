@@ -39,6 +39,11 @@
           <input type="text" id="ollamaUrl" value="http://localhost:11434" spellcheck="false" />
         </div>
         <div class="setting-row">
+          <label>Slot Timeout (seconds)</label>
+          <input type="number" id="slotTimeout" min="1" step="1" placeholder="300" spellcheck="false" />
+          <span class="key-hint">Default cap for non-streaming draft &amp; synth calls. Each slot can override it under Advanced. Note: Ollama requests are hard-capped at 1200s by the HTTP client regardless of higher values here.</span>
+        </div>
+        <div class="setting-row">
           <label>Synth Model Slot</label>
           <select id="synthSlot" class="synth-slot-select">
             <option value="-1">No synth</option>
