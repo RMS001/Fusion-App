@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .config import FusionConfig, SlotConfig, load_config, mask_key, save_config
 from .panel import PanelManager
+from .providers import ProviderError
 
 logger = logging.getLogger(__name__)
 security = HTTPBearer(auto_error=False)
@@ -198,6 +199,21 @@ def create_app() -> FastAPI:
             "synth_system_prompt": cfg.synth_system_prompt,
             "slot_timeout": cfg.slot_timeout,
             "slots": [s.model_dump() for s in cfg.slots],
+            "tools": {
+                **cfg.tools.model_dump(),
+                "context7_api_key": mask_key(cfg.tools.context7_api_key)
+                if cfg.tools.context7_api_key
+                else "",
+                "context7_api_key_set": bool(cfg.tools.context7_api_key),
+                "brave_api_key": mask_key(cfg.tools.brave_api_key)
+                if cfg.tools.brave_api_key
+                else "",
+                "brave_api_key_set": bool(cfg.tools.brave_api_key),
+                "tavily_api_key": mask_key(cfg.tools.tavily_api_key)
+                if cfg.tools.tavily_api_key
+                else "",
+                "tavily_api_key_set": bool(cfg.tools.tavily_api_key),
+            },
         }
 
     class UpdateConfigBody(BaseModel):
@@ -209,6 +225,9 @@ def create_app() -> FastAPI:
         synth_system_prompt: Optional[str] = None
         slot_timeout: Optional[float] = Field(default=None, gt=0)
         slots: Optional[list[SlotConfig]] = Field(default=None, min_length=5, max_length=5)
+        # Partial update: only the keys present are changed, so the UI can
+        # omit secret fields it didn't touch instead of echoing masked values.
+        tools: Optional[dict] = None
 
     @app.put("/api/config", dependencies=[Depends(_require_api_key)])
     async def update_config(body: UpdateConfigBody):
@@ -221,6 +240,8 @@ def create_app() -> FastAPI:
             for k, v in body.model_dump(exclude_unset=True).items()
             if v is not None
         }
+        if "tools" in updates:
+            updates["tools"] = {**cfg.tools.model_dump(), **updates["tools"]}
         try:
             new_cfg = FusionConfig(**{**cfg.model_dump(), **updates})
         except ValidationError as e:
@@ -259,6 +280,21 @@ def create_app() -> FastAPI:
         except Exception as e:
             return {"models": [], "error": str(e)}
 
+    @app.get(
+        "/api/models/ollama/capabilities", dependencies=[Depends(_require_api_key)]
+    )
+    async def ollama_model_capabilities(model: str, base_url: Optional[str] = None):
+        """Capability badge helper for the UI. Advisory only — the provider's
+        400-fallback is the real safety net for non-tool-capable models."""
+        mgr = _get_manager()
+        try:
+            tmp_slot = SlotConfig(provider="ollama", base_url_override=base_url or None)
+            provider = mgr.get_provider(tmp_slot)
+            caps = await provider.show_capabilities(model)
+            return {"capabilities": caps, "tools": "tools" in caps}
+        except Exception as e:
+            return {"capabilities": [], "tools": None, "error": str(e)}
+
     # ── Chat endpoints ─────────────────────────────────────────────
 
     class ChatBody(BaseModel):
@@ -282,6 +318,8 @@ def create_app() -> FastAPI:
         latency_ms: float
         error: Optional[str] = None
         usage: Optional[dict] = None
+        warning: Optional[str] = None
+        tool_trace: Optional[list] = None
 
     def _serialize(resp) -> dict:
         return ChatResponseItem(
@@ -290,6 +328,8 @@ def create_app() -> FastAPI:
             latency_ms=resp.latency_ms,
             error=resp.error,
             usage=resp.usage,
+            warning=resp.warning,
+            tool_trace=resp.tool_trace,
         ).model_dump()
 
     @app.post("/api/chat", dependencies=[Depends(_require_api_key)])
@@ -403,10 +443,23 @@ def create_app() -> FastAPI:
                 synth_started = time.monotonic()
                 full_content = ""
                 synth_error = None
+                tool_trace: list = []
+                synth_warning = None
                 try:
                     async for delta in manager.synthesize_stream_from_collected(
-                        messages, collected_responses, **kwargs
+                        messages, collected_responses, yield_events=True, **kwargs
                     ):
+                        if isinstance(delta, dict):
+                            # Tool-loop liveness/meta events from the synth slot.
+                            # "synth": True distinguishes these from draft-slot
+                            # tool_call events (which carry a "slot" index).
+                            if delta["type"] == "tool_call":
+                                payload = {**delta, "synth": True}
+                                yield f"event: synth_tool\ndata: {json.dumps(payload)}\n\n"
+                            elif delta["type"] == "synth_meta":
+                                tool_trace = delta.get("trace") or []
+                                synth_warning = delta.get("warning")
+                            continue
                         full_content += delta
                         token_event = {"type": "synth_token", "content": delta}
                         yield f"event: synth_token\ndata: {json.dumps(token_event)}\n\n"
@@ -419,6 +472,8 @@ def create_app() -> FastAPI:
                     "synth_model": synth_model,
                     "content": full_content if not synth_error else f"[Synth error: {synth_error}]",
                     "error": synth_error,
+                    "warning": synth_warning,
+                    "tool_trace": tool_trace,
                     "latency_ms": (time.monotonic() - synth_started) * 1000,
                 }
                 yield f"event: synth\ndata: {json.dumps(synth_event)}\n\n"
@@ -492,6 +547,8 @@ def create_app() -> FastAPI:
                 "synth_model": s.model,
                 "synth_slot": cfg.synth_slot,
                 "responses": responses_meta,
+                "tool_trace": result.get("tool_trace") or [],
+                "warning": s.warning,
             }
             if s.error:
                 return _v1_error(s.error, "synth_failed", {"fusion_synth": fusion_meta})
@@ -561,7 +618,22 @@ def create_app() -> FastAPI:
                 )
 
             model = slot.model
-            agen = manager.get_provider(slot).chat_stream(messages, slot.model, **kwargs)
+            if manager._slot_tools(slot):
+                # Tooled slot: run the (non-streaming) tool loop and emit the
+                # final answer as one delta. /v1 streaming stays text-only;
+                # _stream_deltas heartbeats cover the silent loop window.
+                async def _tooled_single(slot=slot):
+                    resp = await manager._chat_slot_routed(slot, messages, **kwargs)
+                    if resp.error:
+                        raise ProviderError(resp.error)
+                    if resp.content:
+                        yield resp.content
+
+                agen = _tooled_single()
+            else:
+                agen = manager.get_provider(slot).chat_stream(
+                    messages, slot.model, **kwargs
+                )
             completion_id = "fusion-stream-" + uuid4().hex[:12]
 
         return StreamingResponse(

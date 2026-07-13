@@ -38,6 +38,19 @@ const privateApiKeyHint = $("#privateApiKeyHint");
 const toggleApiKeyVisBtn = $("#toggleApiKeyVis");
 const synthModeBadge = $("#synthModeBadge");
 const apiKeyBadge = $("#apiKeyBadge");
+const toolsContext7Toggle = $("#toolsContext7Toggle");
+const context7Key = $("#context7Key");
+const context7KeyHint = $("#context7KeyHint");
+const toolsWebToggle = $("#toolsWebToggle");
+const webSearchBackend = $("#webSearchBackend");
+const searxngUrl = $("#searxngUrl");
+const braveKey = $("#braveKey");
+const braveKeyHint = $("#braveKeyHint");
+const tavilyKey = $("#tavilyKey");
+const tavilyKeyHint = $("#tavilyKeyHint");
+const toolsMaxIterations = $("#toolsMaxIterations");
+const synthTools = $("#synthTools");
+const synthWarning = $("#synthWarning");
 
 // ── API fetch (adds the private API key when the server requires one) ──────
 function _storedApiKey() {
@@ -58,6 +71,103 @@ async function apiFetch(url, opts = {}) {
     }
   }
   return resp;
+}
+
+// ── Tools helpers ──────────────────────────────────────────────────────────
+function _updateBackendRows() {
+  const backend = webSearchBackend.value;
+  $("#searxngUrlRow").style.display = backend === "searxng" ? "" : "none";
+  $("#braveKeyRow").style.display = backend === "brave" ? "" : "none";
+  $("#tavilyKeyRow").style.display = backend === "tavily" ? "" : "none";
+}
+
+function _setKeyHint(hintEl, isSet) {
+  hintEl.textContent = isSet ? "✓ Key saved" : "";
+  hintEl.className = isSet ? "key-hint set" : "key-hint";
+}
+
+// Build a collapsible tool-call trace element. Tool names/args/results come
+// from external sources — DOM APIs only, never innerHTML interpolation.
+function buildToolTraceEl(entries, { open = false } = {}) {
+  const details = document.createElement("details");
+  details.open = open;
+  const summary = document.createElement("summary");
+  summary.textContent = `🔧 Tool calls (${entries.length})`;
+  details.appendChild(summary);
+  for (const t of entries) {
+    const row = document.createElement("div");
+    row.className = "tool-row";
+    const head = document.createElement("div");
+    head.className = "tool-row-head";
+    const name = document.createElement("span");
+    name.className = "tool-name";
+    name.textContent = t.name || "?";
+    const args = document.createElement("span");
+    args.className = "tool-args";
+    args.textContent = JSON.stringify(t.arguments ?? {});
+    const ms = document.createElement("span");
+    ms.className = "tool-ms";
+    ms.textContent = t.ms != null ? `${t.ms}ms` : "";
+    head.append(name, args, ms);
+    const result = document.createElement("div");
+    result.className = "tool-result";
+    result.textContent = t.result_preview || "";
+    row.append(head, result);
+    details.appendChild(row);
+  }
+  return details;
+}
+
+function renderToolTrace(entries, { open = false } = {}) {
+  if (!entries || !entries.length) {
+    synthTools.style.display = "none";
+    synthTools.textContent = "";
+    return;
+  }
+  synthTools.style.display = "block";
+  synthTools.textContent = "";
+  synthTools.appendChild(buildToolTraceEl(entries, { open }));
+}
+
+// Per-slot variants (draft slots can tool-call on every path too)
+function renderSlotToolTrace(panel, entries, { open = false } = {}) {
+  const box = panel.querySelector(".slot-tool-trace");
+  if (!box) return;
+  if (!entries || !entries.length) {
+    box.style.display = "none";
+    box.textContent = "";
+    return;
+  }
+  box.style.display = "block";
+  box.textContent = "";
+  box.appendChild(buildToolTraceEl(entries, { open }));
+}
+
+function showSlotWarning(panel, text) {
+  const badge = panel.querySelector(".slot-warning");
+  if (!badge) return;
+  if (text) {
+    badge.textContent = `⚠ ${text}`;
+    badge.style.display = "";
+  } else {
+    badge.style.display = "none";
+  }
+}
+
+function clearAllSlotToolUI() {
+  document.querySelectorAll(".response-panel").forEach((panel) => {
+    renderSlotToolTrace(panel, []);
+    showSlotWarning(panel, null);
+  });
+}
+
+function showSynthWarning(text) {
+  if (text) {
+    synthWarning.textContent = `⚠ ${text}`;
+    synthWarning.style.display = "";
+  } else {
+    synthWarning.style.display = "none";
+  }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -114,6 +224,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   synthModeToggle.addEventListener("change", _updateSynthModeBadge);
   synthSlot.addEventListener("change", _updateSynthModeBadge);
 
+  webSearchBackend.addEventListener("change", _updateBackendRows);
   saveSettingsBtn.addEventListener("click", saveConfig);
   sendBtn.addEventListener("click", () => sendPrompt(false));
   streamBtn.addEventListener("click", () => sendPrompt(true));
@@ -209,8 +320,12 @@ async function loadConfig() {
       if (slotTimeout) {
         slotTimeout.value = slot.timeout ?? "";
       }
+      const slotTools = card.querySelector(".slot-tools");
+      if (slotTools) {
+        slotTools.checked = !!slot.tools_enabled;
+      }
       // Auto-expand Advanced section if any override is set
-      if (slot.base_url_override || slot.timeout) {
+      if (slot.base_url_override || slot.timeout || slot.tools_enabled) {
         const advBody = card.querySelector(".slot-advanced-body");
         const advToggle = card.querySelector(".slot-advanced-toggle");
         if (advBody) advBody.style.display = "block";
@@ -224,6 +339,21 @@ async function loadConfig() {
         panel.querySelector(".model-name").textContent = slot.model || "—";
       }
     });
+
+    // Tools settings
+    const tools = configData.tools || {};
+    toolsContext7Toggle.checked = tools.context7_enabled !== false;
+    toolsWebToggle.checked = tools.web_enabled !== false;
+    webSearchBackend.value = tools.web_search_backend || "duckduckgo";
+    searxngUrl.value = tools.searxng_base_url || "";
+    toolsMaxIterations.value = tools.max_iterations ?? "";
+    _setKeyHint(context7KeyHint, !!tools.context7_api_key_set);
+    _setKeyHint(braveKeyHint, !!tools.brave_api_key_set);
+    _setKeyHint(tavilyKeyHint, !!tools.tavily_api_key_set);
+    context7Key.value = "";
+    braveKey.value = "";
+    tavilyKey.value = "";
+    _updateBackendRows();
 
     updateAllDisabledStates();
     statusBadge.textContent = "● Online";
@@ -292,6 +422,8 @@ async function saveConfig() {
     const timeoutEl = card.querySelector(".slot-timeout");
     const timeoutVal = timeoutEl ? timeoutEl.value.trim() : "";
     slotData.timeout = timeoutVal ? parseFloat(timeoutVal) : null;
+    const toolsEl = card.querySelector(".slot-tools");
+    slotData.tools_enabled = toolsEl ? toolsEl.checked : false;
     slots.push(slotData);
   }
 
@@ -319,6 +451,28 @@ async function saveConfig() {
   }
   if (privateApiKey.value.trim()) {
     body.private_api_key = privateApiKey.value.trim();
+  }
+
+  // Tools: partial update — secret fields only when the user typed a new
+  // value, so saved keys are never clobbered by empty/masked inputs.
+  body.tools = {
+    context7_enabled: toolsContext7Toggle.checked,
+    web_enabled: toolsWebToggle.checked,
+    web_search_backend: webSearchBackend.value,
+    searxng_base_url: searxngUrl.value.trim(),
+  };
+  const maxIter = toolsMaxIterations.value.trim();
+  if (maxIter) {
+    body.tools.max_iterations = parseInt(maxIter, 10);
+  }
+  if (context7Key.value.trim()) {
+    body.tools.context7_api_key = context7Key.value.trim();
+  }
+  if (braveKey.value.trim()) {
+    body.tools.brave_api_key = braveKey.value.trim();
+  }
+  if (tavilyKey.value.trim()) {
+    body.tools.tavily_api_key = tavilyKey.value.trim();
   }
 
   try {
@@ -371,6 +525,8 @@ function buildSlotCards() {
           <span class="slot-url-hint">Only needed for Ollama on a different machine. Leave blank to use the global URL from Settings.</span>
           <input class="slot-timeout" type="number" min="1" step="1" placeholder="Timeout (seconds)" />
           <span class="slot-url-hint">Blank = global Slot Timeout from Settings. Ollama requests are hard-capped at 1200s by the HTTP client.</span>
+          <label class="slot-tools-label"><input class="slot-tools" type="checkbox" /> 🔧 Tools (fact-checking)</label>
+          <span class="slot-url-hint">Lets this slot verify claims via docs lookup, web search, and URL checks. Intended for the synth slot; adds up to Max Tool Rounds × timeout.</span>
         </div>
       </div>
       <button class="model-refresh-btn" data-slot="${i}">↻ Fetch models</button>
@@ -435,7 +591,9 @@ function buildResponsePanels() {
         <span class="slot-label">Slot ${i}</span>
         <span class="model-name">—</span>
         <span class="latency"></span>
+        <span class="warning-badge slot-warning" style="display:none;"></span>
       </div>
+      <div class="slot-tool-trace" style="display:none;"></div>
       <div class="response-content">
         <span class="placeholder">Awaiting prompt…</span>
       </div>
@@ -615,6 +773,8 @@ async function sendSingleShot(prompt) {
         contentDiv.textContent = item.content;
         latency.textContent = `⏱ ${item.latency_ms.toFixed(0)}ms`;
       }
+      renderSlotToolTrace(panel, item.tool_trace || []);
+      showSlotWarning(panel, item.warning);
     }
 
     // Synth mode response
@@ -628,8 +788,12 @@ async function sendSingleShot(prompt) {
       } else {
         synthContent.textContent = synthResult.content;
       }
+      renderToolTrace(synthResult.tool_trace || data.tool_trace);
+      showSynthWarning(synthResult.warning);
     } else {
       synthPanel.style.display = "none";
+      renderToolTrace([]);
+      showSynthWarning(null);
     }
   } catch (e) {
     if (e.name !== "AbortError") {
@@ -688,6 +852,11 @@ async function sendStreaming(prompt, forceSynth = false) {
     let buffer = "";
     const fullTexts = {};
     let synthText = "";
+    const liveTrace = [];
+    const slotTraces = {};
+    renderToolTrace([]);
+    showSynthWarning(null);
+    clearAllSlotToolUI();
 
     while (true) {
       const { done, value } = await reader.read();
@@ -730,6 +899,29 @@ async function sendStreaming(prompt, forceSynth = false) {
               continue;
             }
 
+            if (event.type === "tool_call") {
+              if (event.slot != null && !event.synth) {
+                // Draft slot fact-checking — live per-slot trace
+                const traces = (slotTraces[event.slot] ||= []);
+                traces.push(event);
+                const panel = document.querySelector(
+                  `.response-panel[data-slot="${event.slot}"]`
+                );
+                if (panel) {
+                  renderSlotToolTrace(panel, traces, { open: true });
+                  panel.querySelector(".response-content").innerHTML =
+                    `<span class="placeholder">🔧 Fact-checking (${traces.length})…</span>`;
+                }
+                continue;
+              }
+              // Synth slot fact-checking — show the trace live for liveness
+              liveTrace.push(event);
+              renderToolTrace(liveTrace, { open: true });
+              synthContent.innerHTML =
+                `<span class="placeholder">🔧 Fact-checking with tools (${liveTrace.length} call${liveTrace.length > 1 ? "s" : ""})…</span>`;
+              continue;
+            }
+
             if (event.type === "synth") {
               // Final synth result (also arrives after synth_token streaming)
               synthModelName.textContent = event.synth_model || "synth";
@@ -739,6 +931,8 @@ async function sendStreaming(prompt, forceSynth = false) {
               } else {
                 synthContent.textContent = event.content;
               }
+              renderToolTrace(event.tool_trace || liveTrace);
+              showSynthWarning(event.warning);
               synthPanel.style.display = "block";
               continue;
             }
@@ -758,8 +952,15 @@ async function sendStreaming(prompt, forceSynth = false) {
               fullTexts[slotIdx] = event.full_content || fullTexts[slotIdx] || "";
               contentDiv.textContent = fullTexts[slotIdx];
               latency.textContent = `⏱ ${event.latency_ms.toFixed(0)}ms`;
+              if (event.tool_trace?.length) {
+                renderSlotToolTrace(panel, event.tool_trace);
+              }
+              showSlotWarning(panel, event.warning);
             } else if (event.type === "error") {
               contentDiv.innerHTML = `<span class="error">Error: ${escapeHtml(event.error)}</span>`;
+              if (event.tool_trace?.length) {
+                renderSlotToolTrace(panel, event.tool_trace);
+              }
             }
           } catch (e) {
             // skip malformed JSON
@@ -793,6 +994,7 @@ async function sendSynth() {
     panel.querySelector(".response-content").innerHTML = "";
     panel.querySelector(".latency").textContent = "";
   }
+  clearAllSlotToolUI();
 
   // Cancel any prior in-flight request
   if (abortController) {

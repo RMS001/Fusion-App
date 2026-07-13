@@ -1,6 +1,6 @@
 import json
 import time
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 
 import httpx
 
@@ -33,12 +33,73 @@ class OllamaProvider(LLMProvider):
     def _tags_url(self) -> str:
         return f"{self.base_url}/api/tags"
 
-    def _body(self, messages: list[dict], model: str, stream: bool, **kwargs) -> dict:
+    @staticmethod
+    def _to_wire_message(msg: dict) -> dict:
+        """Translate one normalized message to Ollama's wire format.
+
+        Kept in one place so a format drift upstream is a one-function fix.
+        Ollama tool results use `tool_name` (no call ids); assistant
+        tool_calls carry `arguments` as a plain object.
+        """
+        if msg.get("role") == "tool":
+            return {
+                "role": "tool",
+                "content": msg.get("content", ""),
+                "tool_name": msg.get("name", ""),
+            }
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            return {
+                "role": "assistant",
+                "content": msg.get("content") or "",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": tc.get("name", ""),
+                            "arguments": tc.get("arguments") or {},
+                        }
+                    }
+                    for tc in msg["tool_calls"]
+                ],
+            }
+        return msg
+
+    @staticmethod
+    def _parse_tool_calls(message: dict) -> Optional[list]:
+        """Normalize Ollama tool_calls: arguments arrive as an object (guard
+        for str-encoded JSON anyway); Ollama has no call ids, synthesize them."""
+        raw = message.get("tool_calls")
+        if not raw:
+            return None
+        calls = []
+        for i, tc in enumerate(raw):
+            fn = tc.get("function") or {}
+            args = fn.get("arguments")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = None
+            if not isinstance(args, dict):
+                args = args if args is None else None
+            calls.append({"id": f"call_{i}", "name": fn.get("name", ""), "arguments": args})
+        return calls
+
+    def _body(
+        self,
+        messages: list[dict],
+        model: str,
+        stream: bool,
+        tools: Optional[list[dict]] = None,
+        **kwargs,
+    ) -> dict:
+        msgs = build_messages(messages, kwargs.get("system_prompt"))
         body = {
             "model": model,
-            "messages": build_messages(messages, kwargs.get("system_prompt")),
+            "messages": [self._to_wire_message(m) for m in msgs],
             "stream": stream,
         }
+        if tools:
+            body["tools"] = tools
         if kwargs.get("max_tokens"):
             body["options"] = {"num_predict": kwargs["max_tokens"]}
         return body
@@ -47,24 +108,42 @@ class OllamaProvider(LLMProvider):
         self,
         messages: list[dict],
         model: str,
+        tools: Optional[list[dict]] = None,
         **kwargs,
     ) -> ChatResponse:
         start = time.monotonic()
         try:
             resp = await self._client.post(
                 self._chat_url(),
-                json=self._body(messages, model, stream=False, **kwargs),
+                json=self._body(messages, model, stream=False, tools=tools, **kwargs),
                 timeout=DEFAULT_TIMEOUT,
             )
             resp.raise_for_status()
             data = resp.json()
             elapsed = (time.monotonic() - start) * 1000
 
-            content = data["message"]["content"]
-            return ChatResponse(content=content, model=model, latency_ms=elapsed)
+            message = data.get("message") or {}
+            # Content is empty/absent when the model returns tool_calls.
+            content = message.get("content") or ""
+            return ChatResponse(
+                content=content,
+                model=model,
+                latency_ms=elapsed,
+                tool_calls=self._parse_tool_calls(message),
+            )
         except httpx.HTTPStatusError as e:
             detail = await try_read_body(e.response)
             elapsed = (time.monotonic() - start) * 1000
+            # Models without tool support 400 with a "does not support tools"
+            # message — retry once without tools so the request still succeeds.
+            if (
+                tools
+                and e.response.status_code == 400
+                and "does not support tools" in detail.lower()
+            ):
+                retry = await self.chat(messages, model, tools=None, **kwargs)
+                retry.warning = f"model '{model}' does not support tools; ran without them"
+                return retry
             return ChatResponse(
                 content="",
                 model=model,
@@ -127,3 +206,11 @@ class OllamaProvider(LLMProvider):
             return data.get("models", [])
         except Exception:
             return []
+
+    async def show_capabilities(self, model: str) -> list[str]:
+        """Return the model's capability list from /api/show (e.g. ["completion", "tools"])."""
+        resp = await self._client.post(
+            f"{self.base_url}/api/show", json={"model": model}, timeout=MODELS_TIMEOUT
+        )
+        resp.raise_for_status()
+        return resp.json().get("capabilities", []) or []

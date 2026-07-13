@@ -56,6 +56,7 @@ curl http://localhost:8000/health
 - **Synthesizer** — designate one slot as a "synth" to merge responses from all other models into a single optimal answer
 - **Streaming synthesis** — the synth model's output streams token-by-token through `/v1/chat/completions`, so connected clients see tokens immediately
 - **Custom synth prompt** — customize how the synthesizer merges responses via the UI or API
+- **Built-in fact-checking tools** — opt-in per slot: current library docs (Context7), web search, and URL fetch/HEAD checks let a model verify versions, APIs, and CDN paths against live sources before answering (see **Tools**)
 - **Persistent config** — API keys and slot configuration saved to `~/.fusion_app/config.json` (file is `0600`; keys never leave the machine unmasked)
 - **Private API key** — one key secures **all** `/api/*` and `/v1/*` endpoints; the server refuses to bind to a non-loopback address without one (override with `--insecure`)
 - **Model discovery** — fetch available models from either provider with one click
@@ -78,6 +79,11 @@ fusion-app/
 │   │   ├── base.py                 # Abstract LLM provider interface
 │   │   ├── openrouter.py           # OpenRouter cloud API
 │   │   └── ollama.py               # Ollama local API
+│   ├── tools/
+│   │   ├── base.py                 # Tool interface
+│   │   ├── registry.py             # Assembles enabled tools; dispatches calls
+│   │   ├── context7.py             # Library documentation lookup (Context7)
+│   │   └── web.py                  # web_search + web_fetch (SSRF-guarded)
 │   └── static/
 │       ├── index.html              # Dashboard UI
 │       ├── style.css
@@ -86,7 +92,8 @@ fusion-app/
 │   ├── conftest.py                 # Shared fixtures (temp config, test client)
 │   ├── test_api.py                 # API endpoint tests
 │   ├── test_providers.py           # Provider parsing/contract tests (mocked HTTP)
-│   └── test_streaming.py           # SSE streaming contract tests (mocked HTTP)
+│   ├── test_streaming.py           # SSE streaming contract tests (mocked HTTP)
+│   └── test_tools.py               # Tool loop, SSRF, provider tool-call tests
 └── .gitignore
 ```
 
@@ -244,25 +251,38 @@ Process:
      mistake. Two drafts using the same API, URL, version, or pattern does
      not make it correct.
 
-3. Account for what you cannot verify. You cannot execute code, fetch URLs,
-   or observe runtime behavior. You therefore cannot confirm by reading
-   whether a dependency path resolves, an API signature is current, or the
-   result runs without error. For any choice whose correctness depends on
-   runtime behavior, do NOT prefer a draft's version over your own because
-   it looks plausible — plausibility is not verification. Default to the
-   approach you independently know to be correct and current. If a draft
-   uses an interface, version, or URL you are not independently confident is
-   right, treat it as suspect and keep your own.
+3. Verify instead of trusting plausibility. When fact-checking tools are
+   available to you (documentation lookup, web search, URL fetch), use them
+   to settle every claim whose correctness depends on current external
+   state: dependency/CDN URLs and versions, library loading patterns, API
+   signatures, and any point where the drafts disagree with you or with
+   each other. Check your own baseline's claims too, not just the drafts' —
+   a URL you intend to ship gets fetched, not assumed, and a URL that
+   resolves is still not proof the usage is right: for library loading
+   (CDN scripts, ES modules, import maps) confirm the documented loading
+   pattern, not just that the file exists. Verified evidence
+   outranks everything: if a check proves your baseline wrong, change it;
+   if it proves a draft wrong, discard that part no matter how plausible it
+   reads. When no tools are available or a check fails, do not guess —
+   default to the approach you independently know to be correct and
+   long-term stable, and treat any draft interface, version, or URL you
+   cannot independently vouch for as suspect.
 
 4. If both drafts are wrong, weaker, or take an inferior approach, discard
    them entirely and ship your baseline.
 
 Produce only the final, complete, authoritative answer. Write as the sole
-respondent: no mention of drafts, other engineers, versions, verification,
-or your review process. For code: complete and runnable with no
-placeholders, using dependency versions, import mechanisms, and APIs you are
-confident are current and correct.
+respondent: no mention of drafts, other engineers, tools, verification, or
+your review process. For code: complete and runnable with no placeholders,
+using dependency versions, import mechanisms, and APIs you are confident
+are current and correct.
 ```
+
+Step 3 degrades cleanly whether the synth slot has **Tools** enabled or not
+(its "when no tools are available" branch is the tools-off behavior), so the
+same prompt works in both configurations. With tools on, the server also
+appends its own short fact-checking instruction at runtime — redundant with
+step 3 but consistent, which is harmless.
 
 Note: solve-first synthesis spends more time thinking before the first output token —
 the SSE heartbeats (see *Timeouts & long silent windows* below) keep the stream alive
@@ -377,7 +397,7 @@ curl http://localhost:8000/v1/chat/completions \
 
 #### Timeouts & long silent windows
 
-In synth mode there is no synth output to stream until **every draft has finished** — with large local models that window can run to minutes (a cold model load alone can add 30–60+ seconds). Fusion keeps the connection alive through it: streaming responses emit an SSE comment heartbeat (`: heartbeat`) every 10 seconds of silence, which SSE parsers ignore, so idle timeouts in clients and reverse proxies don't drop the stream.
+In synth mode there is no synth output to stream until **every draft has finished** — with large local models that window can run to minutes (a cold model load alone can add 30–60+ seconds). Fusion keeps the connection alive through it: streaming responses emit an SSE comment heartbeat (`: heartbeat`) every 10 seconds of silence, which SSE parsers ignore, so idle timeouts in clients and reverse proxies don't drop the stream. Slots with **Tools** enabled stretch that window further — budget roughly `tools.max_iterations × slot_timeout` extra per tooled slot in the worst case.
 
 Recommended client/config settings for long panel runs:
 
@@ -433,6 +453,71 @@ Config is stored at `~/.fusion_app/config.json` and auto-saved from the UI.
 | `slots[0..4].model` | varies | Model identifier |
 | `slots[0..4].enabled` | varies | Whether this slot is active |
 | `slots[0..4].base_url_override` | `null` | Override URL for this slot (e.g. a specific Ollama node IP) |
+| `slots[0..4].tools_enabled` | `false` | Let this slot call the built-in fact-checking tools (see **Tools**) |
+| `tools.context7_enabled` | `true` | Offer the Context7 documentation-lookup tools |
+| `tools.context7_api_key` | `""` | Optional Context7 key (`ctx7sk-…`) — raises rate limits |
+| `tools.web_enabled` | `true` | Offer the `web_search` / `web_fetch` tools |
+| `tools.web_search_backend` | `duckduckgo` | `duckduckgo` (keyless), `searxng`, `brave`, or `tavily` |
+| `tools.searxng_base_url` | `""` | Base URL of a self-hosted SearXNG instance |
+| `tools.brave_api_key` / `tools.tavily_api_key` | `""` | Keys for the paid search backends |
+| `tools.web_fetch_max_chars` | `8000` | Truncate fetched page text / doc dumps to this length |
+| `tools.allow_private_networks` | `false` | Allow `web_fetch` to reach LAN/loopback hosts (SSRF guard — leave off) |
+| `tools.max_iterations` | `5` | Max tool-call rounds per request |
+| `tools.tool_timeout` | `30` | Seconds allowed per single tool execution |
+
+## Tools (server-side fact-checking)
+
+Models repeat stale training knowledge — deprecated CDN paths, removed APIs,
+old loading patterns — and a synthesizer without tools is *structurally unable*
+to verify a draft's claims. With tools enabled on a slot (intended: the synth
+slot, via slot card → Advanced → 🔧 Tools), that slot runs an agentic loop and
+can check claims against live sources before answering:
+
+- **`resolve_library` / `get_library_docs`** — current library documentation
+  via [Context7](https://context7.com). Keyless; an API key raises rate limits.
+- **`web_search`** — pluggable backend (DuckDuckGo keyless by default; SearXNG
+  recommended for heavy use).
+- **`web_fetch`** — GET a page and extract readable text, or `mode="head"` to
+  settle "does this CDN URL actually resolve?" with one call.
+
+How it behaves:
+
+- **Default off.** With every slot's `tools_enabled` false, behavior is
+  byte-identical to previous releases.
+- **The checkbox is the only switch.** A tools-enabled slot runs the tool
+  loop on *every* path — Send, Stream, Synthesize, and `/v1` — draft slots
+  included. Best answer over speed: each tooled slot's run gets slower by up
+  to its tool budget, and the panel waits for the slowest draft before
+  synthesis starts.
+- When active, a fact-checking instruction is appended to the slot's system
+  prompt **at runtime** — your customized `synth_system_prompt` is untouched.
+- The tool loop is non-streaming. On streaming paths a tooled slot shows its
+  tool calls live (collapsible **🔧 Tool calls** trace in the slot's panel,
+  and above the synth output for the synth turn); its text then arrives in
+  one piece (not re-generated token-by-token — that would double latency on
+  large local models).
+- Timeouts: each model call in the loop gets the usual slot timeout, each tool
+  execution gets `tool_timeout`, and the loop is capped by `max_iterations` —
+  worst case a tool-enabled request takes roughly
+  `max_iterations × slot_timeout` longer. Budget for that in client timeouts.
+- A model without tool support (Ollama 400s on the request) is retried once
+  without tools and the response carries a warning badge — no crash, plain
+  answer.
+- Non-streaming `/v1` responses include the trace at
+  `fusion_synth.tool_trace`; streaming `/v1` stays text-only. Client-supplied
+  OpenAI `tools` on `/v1` remain unsupported and dropped (see Limitations) —
+  these three layers are distinct: OpenWebUI-native tools = dropped by Fusion,
+  OpenWebUI's own default tools = work today and are invisible to Fusion,
+  Fusion-internal tools = server-side and invisible to clients.
+- **SSRF guard:** `web_fetch` refuses URLs (and redirect hops) that resolve to
+  loopback, RFC1918, link-local/metadata, or CGNAT ranges unless
+  `allow_private_networks` is set. Only enable that if you understand the
+  model can then probe your LAN.
+
+The solve-first synth prompt example above is already tools-aware: its step 3
+tells the model to verify external-state claims with tools when they're
+available and to fall back to conservative, independently-known patterns when
+they're not — so the same prompt works with the slot's Tools toggle on or off.
 
 ## API Endpoints
 
@@ -448,6 +533,7 @@ All endpoints except `/health` and the UI require `Authorization: Bearer <privat
 | `POST` | `/api/synth` | Send prompt to all slots, then synth merges them |
 | `GET` | `/api/models/openrouter` | List OpenRouter models |
 | `GET` | `/api/models/ollama` | List Ollama models (`?base_url=` targets a specific node) |
+| `GET` | `/api/models/ollama/capabilities` | Tool-capability check for one model (`?model=`, `?base_url=`) |
 | `GET` | `/v1/models` | OpenAI-compatible model listing (`fusion-panel`) |
 | `POST` | `/v1/chat/completions` | OpenAI-compatible chat (supports streaming + synth mode) |
 | `GET` | `/docs` | Interactive OpenAPI documentation |
@@ -459,10 +545,11 @@ All endpoints except `/health` and the UI require `Authorization: Bearer <privat
 - Slot `base_url_override` and `ollama_base_url` must be `http(s)` URLs. Only point slots at hosts you trust; the server forwards prompts to them and returns their responses.
 - `~/.fusion_app/config.json` stores keys in plaintext and is written with `0600` permissions. A corrupt config file is backed up to `config.json.bak` instead of being silently replaced.
 - On `/v1/chat/completions`, upstream provider failures return an OpenAI-style error object with HTTP 502 (not a 200 with error text).
+- The `web_fetch` tool refuses URLs — including every redirect hop — whose host resolves to loopback, RFC1918, link-local/metadata, or CGNAT ranges unless `tools.allow_private_networks` is enabled. Tool API keys (Context7/Brave/Tavily) are masked in `GET /api/config` like all other keys.
 
 ## Limitations & Notes
 
-- **No tool / function calling on `/v1`.** The OpenAI-compatible endpoint (`/v1/chat/completions`, model id `fusion-panel`) does not support OpenAI tool calling: a `tools`/`tool_choice` array in the request is silently dropped before it reaches the slot models, and responses always close with `finish_reason: "stop"` and plain text content — never a `tool_calls` array. Agentic coding clients (OpenCode, Cline, etc.) will *appear* to work but no file or tool action ever executes; models may even narrate tool use as prose. This is partly by design: synth mode merges multiple models' prose, and structured tool calls from different models can't be meaningfully merged. Use the Fusion App's own web UI or a plain chat client (Open WebUI, or any OpenAI-compatible client that doesn't rely on tool calling); agentic clients are fine for plain Q&A chat only.
+- **No *client* tool / function calling on `/v1`.** The OpenAI-compatible endpoint (`/v1/chat/completions`, model id `fusion-panel`) does not support OpenAI tool calling: a `tools`/`tool_choice` array in the request is silently dropped before it reaches the slot models, and responses always close with `finish_reason: "stop"` and plain text content — never a `tool_calls` array. Agentic coding clients (OpenCode, Cline, etc.) will *appear* to work but no file or tool action ever executes; models may even narrate tool use as prose. This is partly by design: synth mode merges multiple models' prose, and structured tool calls from different models can't be meaningfully merged. Use the Fusion App's own web UI or a plain chat client (Open WebUI, or any OpenAI-compatible client that doesn't rely on tool calling); agentic clients are fine for plain Q&A chat only. This is unrelated to Fusion's own **Tools** feature, which runs server-side inside the slot's generation and never surfaces as `tool_calls` to clients.
 - **Reasoning models with small `max_tokens`.** A synth model that spends heavily on reasoning tokens can exhaust a small `max_tokens` budget before emitting any answer text, returning empty content. Give reasoning-heavy synth models generous token budgets.
 - **Single process.** The server runs as a single process (there is no `--workers` option). Slot configuration lives in process memory, so multiple workers would serve stale config after a settings change. This is not a practical limit — requests are async and the bottleneck is model inference, not the web server.
 - **Prompt-compression middleware.** If you route this app through prompt-compression or context-reduction middleware, exempt the Synthesizer stage: synthesis quality depends on the synth model seeing the other slots' full drafts, and lossy compression of those drafts degrades the merged answer silently. Compressing multi-turn *history* upstream is fine (and saves tokens × number of slots).
@@ -481,6 +568,7 @@ Tests are fully offline — upstream HTTP calls are mocked with `respx`.
 - Python 3.10+
 - [Ollama](https://ollama.com) (optional — only if using local models)
 - OpenRouter API key (optional — only if using cloud models, or set `OPENROUTER_API_KEY`)
+- `ddgs` + `trafilatura` (optional — only for the web tools; if missing, those tools simply report unavailable)
 
 ## License
 

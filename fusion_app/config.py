@@ -36,6 +36,63 @@ def _validate_http_url(value: str) -> str:
     return value
 
 
+WEB_SEARCH_BACKENDS = ("duckduckgo", "searxng", "brave", "tavily")
+
+
+class ToolsConfig(BaseModel):
+    """Global settings for the built-in fact-checking tools.
+
+    These gate which tools are *available*; slots still opt in individually
+    via SlotConfig.tools_enabled.
+    """
+
+    context7_enabled: bool = Field(
+        default=True, description="Offer the Context7 documentation-lookup tools"
+    )
+    context7_api_key: str = Field(
+        default="", description="Optional Context7 API key (raises rate limits)"
+    )
+    web_enabled: bool = Field(
+        default=True, description="Offer the web_search / web_fetch tools"
+    )
+    web_search_backend: str = Field(
+        default="duckduckgo",
+        description="'duckduckgo' (keyless), 'searxng', 'brave', or 'tavily'",
+    )
+    searxng_base_url: str = Field(
+        default="", description="Base URL of a SearXNG instance (backend='searxng')"
+    )
+    brave_api_key: str = Field(default="", description="Brave Search API key")
+    tavily_api_key: str = Field(default="", description="Tavily API key")
+    web_fetch_max_chars: int = Field(
+        default=8000, gt=0, description="Truncate extracted page text to this length"
+    )
+    allow_private_networks: bool = Field(
+        default=False,
+        description="Allow web_fetch to reach loopback/RFC1918/link-local hosts (SSRF guard)",
+    )
+    max_iterations: int = Field(
+        default=5, ge=1, description="Max tool-call rounds per request"
+    )
+    tool_timeout: float = Field(
+        default=30.0, gt=0, description="Seconds allowed per single tool execution"
+    )
+
+    @field_validator("web_search_backend")
+    @classmethod
+    def _check_backend(cls, v: str) -> str:
+        if v not in WEB_SEARCH_BACKENDS:
+            raise ValueError(f"must be one of {WEB_SEARCH_BACKENDS}, got {v!r}")
+        return v
+
+    @field_validator("searxng_base_url")
+    @classmethod
+    def _check_searxng_url(cls, v: str) -> str:
+        if not v:
+            return ""
+        return _validate_http_url(v)
+
+
 class SlotConfig(BaseModel):
     """Configuration for a single model slot (0-4)."""
 
@@ -52,6 +109,10 @@ class SlotConfig(BaseModel):
         gt=0,
         description="Per-slot timeout in seconds for non-streaming calls. "
         "Falls back to global slot_timeout if not set.",
+    )
+    tools_enabled: bool = Field(
+        default=False,
+        description="Let this slot call the built-in tools (intended for the synth slot)",
     )
 
     @field_validator("base_url_override")
@@ -90,6 +151,8 @@ class FusionConfig(BaseModel):
         gt=0,
         description="Max seconds to wait for a single slot's non-streaming response",
     )
+
+    tools: ToolsConfig = Field(default_factory=ToolsConfig)
 
     slots: list[SlotConfig] = Field(
         default_factory=lambda: [

@@ -1,6 +1,6 @@
 import json
 import time
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 
 import httpx
 
@@ -34,12 +34,75 @@ class OpenRouterProvider(LLMProvider):
             "X-Title": "Fusion App",
         }
 
-    def _body(self, messages: list[dict], model: str, stream: bool, **kwargs) -> dict:
+    @staticmethod
+    def _to_wire_message(msg: dict) -> dict:
+        """Translate one normalized message to OpenAI wire format:
+        tool results keep tool_call_id; assistant tool_calls carry
+        `arguments` as a JSON string."""
+        if msg.get("role") == "tool":
+            return {
+                "role": "tool",
+                "tool_call_id": msg.get("tool_call_id") or "",
+                "content": msg.get("content", ""),
+            }
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            return {
+                "role": "assistant",
+                "content": msg.get("content") or None,
+                "tool_calls": [
+                    {
+                        "id": tc.get("id") or f"call_{i}",
+                        "type": "function",
+                        "function": {
+                            "name": tc.get("name", ""),
+                            "arguments": json.dumps(tc.get("arguments") or {}),
+                        },
+                    }
+                    for i, tc in enumerate(msg["tool_calls"])
+                ],
+            }
+        return msg
+
+    @staticmethod
+    def _parse_tool_calls(message: dict) -> Optional[list]:
+        """Normalize OpenAI-style tool_calls: `arguments` is a JSON string;
+        malformed JSON yields arguments=None (per-call ERROR downstream,
+        never a crash)."""
+        raw = message.get("tool_calls")
+        if not raw:
+            return None
+        calls = []
+        for i, tc in enumerate(raw):
+            fn = tc.get("function") or {}
+            args = fn.get("arguments")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = None
+            if not isinstance(args, dict):
+                args = None
+            calls.append(
+                {"id": tc.get("id") or f"call_{i}", "name": fn.get("name", ""), "arguments": args}
+            )
+        return calls
+
+    def _body(
+        self,
+        messages: list[dict],
+        model: str,
+        stream: bool,
+        tools: Optional[list[dict]] = None,
+        **kwargs,
+    ) -> dict:
+        msgs = build_messages(messages, kwargs.get("system_prompt"))
         body = {
             "model": model,
-            "messages": build_messages(messages, kwargs.get("system_prompt")),
+            "messages": [self._to_wire_message(m) for m in msgs],
             "stream": stream,
         }
+        if tools:
+            body["tools"] = tools
         if kwargs.get("max_tokens"):
             body["max_tokens"] = kwargs["max_tokens"]
         return body
@@ -48,6 +111,7 @@ class OpenRouterProvider(LLMProvider):
         self,
         messages: list[dict],
         model: str,
+        tools: Optional[list[dict]] = None,
         **kwargs,
     ) -> ChatResponse:
         if not self.api_key:
@@ -60,17 +124,23 @@ class OpenRouterProvider(LLMProvider):
             resp = await self._client.post(
                 OPENROUTER_CHAT_URL,
                 headers=self._headers(),
-                json=self._body(messages, model, stream=False, **kwargs),
+                json=self._body(messages, model, stream=False, tools=tools, **kwargs),
                 timeout=DEFAULT_TIMEOUT,
             )
             resp.raise_for_status()
             data = resp.json()
             elapsed = (time.monotonic() - start) * 1000
 
-            content = data["choices"][0]["message"]["content"]
+            message = data["choices"][0]["message"]
+            # content is null when the model returns tool_calls
+            content = message.get("content") or ""
             usage = data.get("usage")
             return ChatResponse(
-                content=content, model=model, latency_ms=elapsed, usage=usage
+                content=content,
+                model=model,
+                latency_ms=elapsed,
+                usage=usage,
+                tool_calls=self._parse_tool_calls(message),
             )
         except httpx.HTTPStatusError as e:
             detail = await try_read_body(e.response)

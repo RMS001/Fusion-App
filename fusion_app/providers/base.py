@@ -18,6 +18,15 @@ class ChatResponse:
     latency_ms: float = 0.0
     usage: Optional[dict] = None
     error: Optional[str] = None
+    # Normalized tool calls regardless of provider:
+    # [{"id": str|None, "name": str, "arguments": dict|None}]
+    # arguments is None when the provider returned unparseable JSON.
+    tool_calls: Optional[list] = None
+    # Non-fatal notice (e.g. "model does not support tools; ran without").
+    warning: Optional[str] = None
+    # Tool-loop trace attached by PanelManager when this response was
+    # produced through _chat_with_tools.
+    tool_trace: Optional[list] = None
 
 
 def build_messages(messages: list[dict], system_prompt: Optional[str] = None) -> list[dict]:
@@ -51,9 +60,17 @@ class LLMProvider(ABC):
         self,
         messages: list[dict],
         model: str,
+        tools: Optional[list[dict]] = None,
         **kwargs,
     ) -> ChatResponse:
-        """Send messages to a model and return the full response."""
+        """Send messages to a model and return the full response.
+
+        `tools` is an OpenAI-style specs array. Messages may contain
+        normalized assistant tool_calls / role:"tool" entries (see
+        ChatResponse.tool_calls); each provider translates them to its
+        native wire format. chat_stream() never takes tools — the tool
+        loop is non-streaming by design.
+        """
         ...
 
     @abstractmethod

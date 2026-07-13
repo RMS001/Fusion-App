@@ -7,10 +7,37 @@ import httpx
 
 from .config import FusionConfig, SlotConfig
 from .providers import ChatResponse, OllamaProvider, OpenRouterProvider
+from .tools import Tool, build_tools, dispatch, specs
 
 logger = logging.getLogger(__name__)
 
 STREAM_QUEUE_MAXSIZE = 256
+
+TRACE_PREVIEW_CHARS = 300
+
+# Injected at runtime whenever a slot runs with tools, instead of baked into
+# DEFAULT_SYNTH_PROMPT: synth_system_prompt is persisted verbatim into
+# config.json, so a changed default would never reach existing installs.
+TOOLS_SYSTEM_ADDENDUM = """\
+You have fact-checking tools (documentation lookup, web search, URL fetch). \
+Before finalizing, you MUST verify with tools any claim that depends on \
+current external state, including: dependency/CDN URLs and versions, library \
+loading patterns, API signatures, and anything the drafts disagree on. \
+Do not trust a draft's URL or API usage because it looks plausible; check it. \
+An HTTP 200 on a URL proves it exists, not that it works: for browser and \
+library loading (CDN scripts, ES modules, import maps), verify the DOCUMENTED \
+loading pattern via documentation lookup before shipping it. \
+If tools fail, say nothing about them — fall back to your most conservative \
+knowledge and prefer patterns you are certain are long-term stable."""
+
+# Appended transiently to every tool-loop model call (never persisted into the
+# transcript): after many tool rounds the system prompt's output contract is
+# far away and loses to recency — this keeps it adjacent to the final turn.
+TOOLS_FINAL_ANSWER_REMINDER = (
+    "Keep calling tools if you still need verification. When you have enough, "
+    "immediately write the final, polished answer as the sole respondent — do "
+    "not mention drafts, other engineers, tools, verification, or your process."
+)
 
 
 class PanelManager:
@@ -59,6 +86,112 @@ class PanelManager:
                 error=f"Timed out after {timeout:g}s",
             )
 
+    # ── Agentic tool loop ──────────────────────────────────────────
+
+    def _slot_tools(self, slot: SlotConfig) -> list[Tool]:
+        """Tools available to this slot ([] when the slot hasn't opted in)."""
+        if not slot.tools_enabled:
+            return []
+        return build_tools(self.config, self._client)
+
+    async def _chat_with_tools_events(
+        self, slot: SlotConfig, messages: list[dict], tools: list[Tool], **kwargs
+    ):
+        """Non-streaming tool loop as an event generator.
+
+        Yields {"type": "tool_call", name, arguments, result_preview, ms}
+        as each tool executes (so streaming consumers can show liveness),
+        then exactly one {"type": "final", response, trace, messages}.
+
+        Timeout semantics: each model call gets the per-slot slot_timeout,
+        each tool execution gets tools.tool_timeout; the loop itself is
+        capped by tools.max_iterations, not a wall clock.
+        """
+        tool_specs = specs(tools)
+        msgs = list(messages)
+        trace: list[dict] = []
+        warning = None
+        resp = None
+        reminder = {"role": "user", "content": TOOLS_FINAL_ANSWER_REMINDER}
+        for _ in range(self.config.tools.max_iterations):
+            # Reminder rides on the call, never on the persisted transcript.
+            resp = await self._chat_with_timeout(
+                slot, msgs + [reminder], tools=tool_specs, **kwargs
+            )
+            if resp.warning:
+                warning = resp.warning
+            if resp.error or not resp.tool_calls:
+                break
+            msgs.append(
+                {
+                    "role": "assistant",
+                    "content": resp.content or "",
+                    "tool_calls": resp.tool_calls,
+                }
+            )
+            for call in resp.tool_calls:
+                name = call.get("name", "")
+                args = call.get("arguments")
+                start = time.monotonic()
+                if isinstance(args, dict):
+                    result = await dispatch(
+                        tools, name, args, self.config.tools.tool_timeout
+                    )
+                else:
+                    result = f"ERROR: malformed JSON in arguments for tool '{name}'"
+                elapsed = (time.monotonic() - start) * 1000
+                msgs.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.get("id"),
+                        "name": name,
+                        "content": result,
+                    }
+                )
+                entry = {
+                    "name": name,
+                    "arguments": args if isinstance(args, dict) else None,
+                    "result_preview": result[:TRACE_PREVIEW_CHARS],
+                    "ms": round(elapsed),
+                }
+                trace.append(entry)
+                yield {"type": "tool_call", **entry}
+        else:
+            # Iteration cap hit with the model still asking for tools.
+            msgs.append(
+                {
+                    "role": "user",
+                    "content": "Tool budget exhausted. Answer the original "
+                    "request now with what you have. "
+                    + TOOLS_FINAL_ANSWER_REMINDER,
+                }
+            )
+            resp = await self._chat_with_timeout(slot, msgs, **kwargs)
+
+        if warning and not resp.warning:
+            resp.warning = warning
+        resp.tool_trace = trace
+        yield {"type": "final", "response": resp, "trace": trace, "messages": msgs}
+
+    async def _chat_with_tools(
+        self, slot: SlotConfig, messages: list[dict], tools: list[Tool], **kwargs
+    ) -> tuple[list[dict], ChatResponse, list[dict]]:
+        """Run the tool loop to completion. Returns (messages, response, trace)."""
+        async for event in self._chat_with_tools_events(slot, messages, tools, **kwargs):
+            if event["type"] == "final":
+                return event["messages"], event["response"], event["trace"]
+        raise RuntimeError("tool loop ended without a final event")  # unreachable
+
+    async def _chat_slot_routed(
+        self, slot: SlotConfig, messages: list[dict], **kwargs
+    ) -> ChatResponse:
+        """One slot call, through the tool loop when the slot has opted in."""
+        tools = self._slot_tools(slot)
+        if not tools:
+            return await self._chat_with_timeout(slot, messages, **kwargs)
+        _, resp, _ = await self._chat_with_tools(slot, messages, tools, **kwargs)
+        return resp
+
     # ── Single-shot chat ───────────────────────────────────────────
 
     async def chat_all(self, messages: list[dict], **kwargs) -> dict[str, Optional[ChatResponse]]:
@@ -68,7 +201,7 @@ class PanelManager:
             slot = self.config.slots[i]
             if not slot.enabled:
                 return i, None
-            return i, await self._chat_with_timeout(slot, messages, **kwargs)
+            return i, await self._chat_slot_routed(slot, messages, **kwargs)
 
         results_list = await asyncio.gather(
             *(_do(i) for i in range(5)), return_exceptions=True
@@ -98,7 +231,7 @@ class PanelManager:
                 error=f"Slot {slot_index} is disabled",
             )
 
-        return await self._chat_with_timeout(slot, messages, **kwargs)
+        return await self._chat_slot_routed(slot, messages, **kwargs)
 
     # ── Streaming chat (multiplexed over an asyncio.Queue) ─────────
 
@@ -127,9 +260,56 @@ class PanelManager:
 
         async def _stream_slot(i: int):
             slot = self.config.slots[i]
+            start = time.monotonic()
+
+            # tools_enabled applies on EVERY path. The loop is non-streaming,
+            # so a tooled slot emits live tool_call events for liveness and
+            # then its full text in one chunk (best answer over speed). Note
+            # its model calls run under slot_timeout per call, unlike pure
+            # streaming which has no wall clock.
+            tools = self._slot_tools(slot)
+            if tools:
+                try:
+                    async for event in self._chat_with_tools_events(
+                        slot, messages, tools, **kwargs
+                    ):
+                        if event["type"] == "tool_call":
+                            entry = {k: v for k, v in event.items() if k != "type"}
+                            await queue.put({"type": "tool_call", "slot": i, **entry})
+                            continue
+                        resp = event["response"]
+                        elapsed = (time.monotonic() - start) * 1000
+                        if resp.error:
+                            await queue.put(
+                                {
+                                    "type": "error",
+                                    "slot": i,
+                                    "error": resp.error,
+                                    "tool_trace": event["trace"],
+                                }
+                            )
+                        else:
+                            await queue.put(
+                                {"type": "token", "slot": i, "content": resp.content}
+                            )
+                            await queue.put(
+                                {
+                                    "type": "done",
+                                    "slot": i,
+                                    "model": slot.model,
+                                    "latency_ms": elapsed,
+                                    "full_content": resp.content,
+                                    "tool_trace": event["trace"],
+                                    "warning": resp.warning,
+                                }
+                            )
+                except Exception as e:
+                    logger.warning("Slot %d tool loop failed: %s", i, e)
+                    await queue.put({"type": "error", "slot": i, "error": str(e)})
+                return
+
             provider = self.get_provider(slot)
             full_text = ""
-            start = time.monotonic()
 
             try:
                 async for chunk in provider.chat_stream(messages, slot.model, **kwargs):
@@ -193,7 +373,7 @@ class PanelManager:
                 continue
             slot = self.config.slots[i]
             if slot.enabled and slot.model:
-                return await self._chat_with_timeout(slot, messages, **kwargs)
+                return await self._chat_slot_routed(slot, messages, **kwargs)
         return ChatResponse(
             content="",
             model="",
@@ -209,7 +389,7 @@ class PanelManager:
 
         async def _get_draft(i: int):
             slot = self.config.slots[i]
-            resp = await self._chat_with_timeout(slot, messages, **kwargs)
+            resp = await self._chat_slot_routed(slot, messages, **kwargs)
             return f"Slot {i} ({slot.model})", resp
 
         tasks = [
@@ -272,22 +452,34 @@ class PanelManager:
                 ),
             }
 
-        synth_messages = self._build_synth_messages(messages, responses)
-        synthesis = await self._chat_with_timeout(synth_slot, synth_messages, **kwargs)
+        tools = self._slot_tools(synth_slot)
+        synth_messages = self._build_synth_messages(
+            messages, responses, tools_active=bool(tools)
+        )
+        if tools:
+            _, synthesis, trace = await self._chat_with_tools(
+                synth_slot, synth_messages, tools, **kwargs
+            )
+        else:
+            synthesis = await self._chat_with_timeout(synth_slot, synth_messages, **kwargs)
+            trace = []
 
         return {
             "responses": responses,
             "synthesis": synthesis,
+            "tool_trace": trace,
         }
 
     async def synthesize_stream(
-        self, messages: list[dict], **kwargs
-    ) -> AsyncGenerator[str, None]:
+        self, messages: list[dict], yield_events: bool = False, **kwargs
+    ) -> AsyncGenerator:
         """
         Gather draft responses from all enabled slots, build the synth
         meta-prompt, then stream the synth model's response token-by-token.
 
-        Yields plain-text content deltas.
+        Yields plain-text content deltas. With yield_events=True, dict
+        events ({"type": "tool_call"} / {"type": "synth_meta"}) are
+        interleaved when the synth slot runs with tools.
         """
         config_error = self._synth_config_error()
         if config_error:
@@ -303,13 +495,65 @@ class PanelManager:
             yield "[Error: No non-synth slots are enabled]"
             return
 
-        synth_messages = self._build_synth_messages(messages, responses)
+        async for item in self._stream_synth_turn(
+            synth_slot, messages, responses, yield_events, **kwargs
+        ):
+            yield item
+
+    async def _stream_synth_turn(
+        self,
+        synth_slot: SlotConfig,
+        messages: list[dict],
+        responses: dict[str, ChatResponse],
+        yield_events: bool,
+        **kwargs,
+    ):
+        """Shared tail of the streaming synth paths.
+
+        Without tools: token deltas straight from chat_stream (no wall-clock
+        timeout — tokens are liveness). With tools: the loop is non-streaming,
+        so yield dict events for liveness ({"type": "tool_call"} per call,
+        one {"type": "synth_meta"} with trace+warning), then the final
+        buffered answer as one str chunk. Deliberately NOT regenerating the
+        final turn as a stream — on large local synth models that would
+        double the synth latency.
+        """
+        tools = self._slot_tools(synth_slot)
+        synth_messages = self._build_synth_messages(
+            messages, responses, tools_active=bool(tools)
+        )
+        if tools:
+            async for event in self._chat_with_tools_events(
+                synth_slot, synth_messages, tools, **kwargs
+            ):
+                if event["type"] == "tool_call":
+                    if yield_events:
+                        yield event
+                    continue
+                resp = event["response"]
+                if yield_events:
+                    yield {
+                        "type": "synth_meta",
+                        "trace": event["trace"],
+                        "warning": resp.warning,
+                    }
+                if resp.error:
+                    yield f"[Error: {resp.error}]"
+                elif resp.content:
+                    yield resp.content
+            return
+
         synth_provider = self.get_provider(synth_slot)
-        async for chunk in synth_provider.chat_stream(synth_messages, synth_slot.model, **kwargs):
+        async for chunk in synth_provider.chat_stream(
+            synth_messages, synth_slot.model, **kwargs
+        ):
             yield chunk
 
     def _build_synth_messages(
-        self, original_messages: list[dict], responses: dict[str, ChatResponse]
+        self,
+        original_messages: list[dict],
+        responses: dict[str, ChatResponse],
+        tools_active: bool = False,
     ) -> list[dict]:
         """Build the message array for the synthesizer model."""
         user_prompt = original_messages[-1]["content"] if original_messages else "(no prompt)"
@@ -326,8 +570,11 @@ class PanelManager:
         # override it from last position.
         parts.append("\nProduce your final response to the original prompt now.")
 
+        system = self.config.synth_system_prompt
+        if tools_active:
+            system = f"{system}\n\n{TOOLS_SYSTEM_ADDENDUM}"
         return [
-            {"role": "system", "content": self.config.synth_system_prompt},
+            {"role": "system", "content": system},
             {"role": "user", "content": "\n".join(parts)},
         ]
 
@@ -352,20 +599,35 @@ class PanelManager:
             for label, text in collected_responses.items()
         }
 
-        synth_messages = self._build_synth_messages(messages, responses)
-        synthesis = await self._chat_with_timeout(synth_slot, synth_messages, **kwargs)
+        tools = self._slot_tools(synth_slot)
+        synth_messages = self._build_synth_messages(
+            messages, responses, tools_active=bool(tools)
+        )
+        if tools:
+            _, synthesis, trace = await self._chat_with_tools(
+                synth_slot, synth_messages, tools, **kwargs
+            )
+        else:
+            synthesis = await self._chat_with_timeout(synth_slot, synth_messages, **kwargs)
+            trace = []
 
-        return {"synthesis": synthesis}
+        return {"synthesis": synthesis, "tool_trace": trace}
 
     async def synthesize_stream_from_collected(
-        self, messages: list[dict], collected_responses: dict[str, str], **kwargs
-    ) -> AsyncGenerator[str, None]:
+        self,
+        messages: list[dict],
+        collected_responses: dict[str, str],
+        yield_events: bool = False,
+        **kwargs,
+    ) -> AsyncGenerator:
         """
         Stream the synth model's response token-by-token using pre-collected
         draft texts (the streaming twin of synthesize_from_collected).
 
-        Yields plain-text content deltas. No wall-clock timeout: the tokens
-        themselves are the liveness signal, matching the other streaming paths.
+        Yields plain-text content deltas (plus dict events when
+        yield_events=True and the synth slot runs with tools). No wall-clock
+        timeout: the tokens themselves are the liveness signal, matching the
+        other streaming paths.
         """
         config_error = self._synth_config_error()
         if config_error:
@@ -379,9 +641,7 @@ class PanelManager:
             for label, text in collected_responses.items()
         }
 
-        synth_messages = self._build_synth_messages(messages, responses)
-        synth_provider = self.get_provider(synth_slot)
-        async for chunk in synth_provider.chat_stream(
-            synth_messages, synth_slot.model, **kwargs
+        async for item in self._stream_synth_turn(
+            synth_slot, messages, responses, yield_events, **kwargs
         ):
-            yield chunk
+            yield item

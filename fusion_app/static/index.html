@@ -76,6 +76,57 @@
           </div>
           <span class="key-hint" id="privateApiKeyHint"></span>
         </div>
+        <div class="settings-subhead">🔧 Tools (fact-checking for tool-enabled slots)</div>
+        <div class="setting-row">
+          <label>Context7 Docs Lookup</label>
+          <label class="toggle-switch">
+            <input type="checkbox" id="toolsContext7Toggle" checked />
+            <span class="toggle-slider"></span>
+          </label>
+          <span class="key-hint">Current library documentation. Keyless; an API key raises rate limits.</span>
+        </div>
+        <div class="setting-row">
+          <label>Context7 API Key</label>
+          <input type="password" id="context7Key" placeholder="ctx7sk-… (optional)" spellcheck="false" />
+          <span class="key-hint" id="context7KeyHint"></span>
+        </div>
+        <div class="setting-row">
+          <label>Web Search + Fetch</label>
+          <label class="toggle-switch">
+            <input type="checkbox" id="toolsWebToggle" checked />
+            <span class="toggle-slider"></span>
+          </label>
+          <span class="key-hint">Lets tool-enabled slots search the web and check that URLs resolve</span>
+        </div>
+        <div class="setting-row">
+          <label>Search Backend</label>
+          <select id="webSearchBackend">
+            <option value="duckduckgo">DuckDuckGo (keyless)</option>
+            <option value="searxng">SearXNG (self-hosted)</option>
+            <option value="brave">Brave (API key)</option>
+            <option value="tavily">Tavily (API key)</option>
+          </select>
+          <span class="key-hint">DuckDuckGo needs no key but can be flaky under heavy use</span>
+        </div>
+        <div class="setting-row" id="searxngUrlRow" style="display:none;">
+          <label>SearXNG Base URL</label>
+          <input type="text" id="searxngUrl" placeholder="http://192.168.1.x:8888" spellcheck="false" />
+        </div>
+        <div class="setting-row" id="braveKeyRow" style="display:none;">
+          <label>Brave API Key</label>
+          <input type="password" id="braveKey" spellcheck="false" />
+          <span class="key-hint" id="braveKeyHint"></span>
+        </div>
+        <div class="setting-row" id="tavilyKeyRow" style="display:none;">
+          <label>Tavily API Key</label>
+          <input type="password" id="tavilyKey" spellcheck="false" />
+          <span class="key-hint" id="tavilyKeyHint"></span>
+        </div>
+        <div class="setting-row">
+          <label>Max Tool Rounds</label>
+          <input type="number" id="toolsMaxIterations" min="1" step="1" placeholder="5" />
+          <span class="key-hint">Cap on tool-call rounds per request. Worst case adds ~rounds × slot timeout.</span>
+        </div>
         <div class="setting-row">
           <button class="btn btn-primary" id="saveSettings">Save Settings</button>
           <span class="save-msg" id="saveMsg"></span>
@@ -110,7 +161,9 @@
         <span>⚡ Synthesized Output</span>
         <span class="synth-model-name" id="synthModelName">—</span>
         <span class="latency" id="synthLatency"></span>
+        <span class="warning-badge" id="synthWarning" style="display:none;"></span>
       </div>
+      <div class="synth-tools" id="synthTools" style="display:none;"></div>
       <div class="synth-content" id="synthContent">
         <span class="placeholder">Run a synthesis to see the merged response here.</span>
       </div>
